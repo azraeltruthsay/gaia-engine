@@ -779,6 +779,105 @@ class GAIAEngine:
                 },
             }
 
+    def generate_stream(self, messages: list, max_tokens: int = 512,
+                         temperature: float = 0.7, top_p: float = 0.9):
+        """Generate a chat completion with per-token streaming.
+
+        Yields dicts with delta content for each token, compatible with
+        the OpenAI SSE streaming format. Final yield has finish_reason.
+        """
+        # Reuse the same setup as generate() — build input_ids and KV cache
+        # This is a simplified version that skips prefix cache for streaming
+        with self._lock:
+            system = ""
+            conversation = []
+            for msg in messages:
+                if msg.get("role") == "system":
+                    system = msg.get("content", "")
+                else:
+                    conversation.append(msg)
+
+            # Build prompt
+            parts = []
+            if system:
+                parts.append(f"<|im_start|>system\n{system}<|im_end|>")
+            for msg in conversation:
+                parts.append(f"<|im_start|>{msg['role']}\n{msg.get('content', '')}<|im_end|>")
+            parts.append("<|im_start|>assistant\n")
+            prompt = "\n".join(parts)
+
+            input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.model.device)
+            eos_id = self.tokenizer.eos_token_id or 151643
+
+            # Suppress <think> token
+            _think_token_id = -1
+            try:
+                _ids = self.tokenizer.encode("<think>", add_special_tokens=False)
+                if _ids:
+                    _think_token_id = _ids[-1]
+            except Exception:
+                pass
+
+            with torch.no_grad():
+                out = self.model(input_ids, use_cache=True)
+            current_kv = out.past_key_values
+            logits = out.logits[:, -1, :]
+
+            generated = []
+            gen_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+            prev_text = ""
+
+            for step in range(max_tokens):
+                if 0 <= _think_token_id < logits.shape[-1]:
+                    logits[0, _think_token_id] = float("-inf")
+
+                # Sample
+                if temperature > 0:
+                    scaled = logits / temperature
+                    if top_p < 1.0:
+                        sorted_logits, sorted_idx = torch.sort(scaled, descending=True)
+                        cumprobs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                        mask = (cumprobs - F.softmax(sorted_logits, dim=-1)) >= top_p
+                        sorted_logits[mask] = float("-inf")
+                        logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
+                    next_id = torch.multinomial(F.softmax(logits, dim=-1), 1)
+                else:
+                    next_id = logits.argmax(dim=-1, keepdim=True)
+
+                token = next_id.item()
+                if token == eos_id:
+                    break
+                generated.append(token)
+
+                # Decode incrementally — get the new text added by this token
+                full_text = self.tokenizer.decode(generated, skip_special_tokens=True)
+                delta = full_text[len(prev_text):]
+                prev_text = full_text
+
+                if delta:
+                    yield {
+                        "id": gen_id,
+                        "choices": [{"delta": {"content": delta}, "finish_reason": None}],
+                    }
+
+                # Forward single token
+                with torch.no_grad():
+                    out = self.model(next_id, past_key_values=current_kv, use_cache=True)
+                current_kv = out.past_key_values
+                logits = out.logits[:, -1, :]
+
+            self._request_count += 1
+            self._total_tokens += len(generated)
+
+            # Final chunk with finish_reason
+            yield {
+                "id": gen_id,
+                "choices": [{
+                    "message": {"role": "assistant", "content": prev_text.strip()},
+                    "finish_reason": "stop" if len(generated) < max_tokens else "length",
+                }],
+            }
+
     def migrate_to(self, target: str) -> dict:
         """Migrate model between GPU and CPU."""
         with self._lock:
@@ -990,18 +1089,18 @@ class EngineHandler(BaseHTTPRequestHandler):
                     skip_prefix=b.get("skip_prefix", False))
 
                 if stream:
-                    # SSE format — compatible with vllm_remote_model._stream_chat()
-                    content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    # True per-token SSE streaming
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
                     self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Transfer-Encoding", "chunked")
                     self.end_headers()
 
-                    # Send content as a single SSE chunk (true token streaming is future work)
-                    chunk = json.dumps({
-                        "choices": [{"delta": {"content": content}, "finish_reason": None}]
-                    })
-                    self.wfile.write(f"data: {chunk}\n\n".encode())
+                    for chunk in _engine.generate_stream(
+                        b.get("messages", []), b.get("max_tokens", 512),
+                        b.get("temperature", 0.7), b.get("top_p", 0.9)):
+                        self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                        self.wfile.flush()
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
                 else:

@@ -35,6 +35,66 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 logger = logging.getLogger("GAIA.Engine")
 
+
+# ── Activation JSONL Writer ──────────────────────────────────────────────────
+
+def _write_activation(tier, token, token_idx, session_id, snapshot, sae=None, labels=None):
+    """Write per-token activation data to JSONL for live visualization.
+
+    Called from generate_stream() after each token's forward pass when
+    the activation monitor is enabled.  The JSONL file is tailed by
+    gaia-web's SSE endpoint to drive the Neural Mind Map in real-time.
+
+    Never raises — inference must never crash for visualization.
+    """
+    from datetime import datetime, timezone
+
+    features = []
+    if sae and snapshot:
+        # SAE decomposition into interpretable features
+        for layer_key, layer_data in snapshot.items():
+            try:
+                layer_idx = int(layer_key.split("_")[1])
+            except (IndexError, ValueError):
+                continue
+            for idx, val in zip(layer_data.get("top_5_indices", []),
+                                layer_data.get("top_5_values", [])):
+                label = (labels or {}).get(layer_idx, {}).get(int(idx), f"feature_{idx}")
+                features.append({"idx": int(idx), "strength": float(val),
+                                 "label": label, "layer": layer_idx})
+    elif snapshot:
+        # No SAE — use raw polygraph top activations
+        for layer_key, layer_data in snapshot.items():
+            try:
+                layer_idx = int(layer_key.split("_")[1])
+            except (IndexError, ValueError):
+                continue
+            for idx, val in zip(layer_data.get("top_5_indices", []),
+                                layer_data.get("top_5_values", [])):
+                features.append({"idx": int(idx), "strength": float(val),
+                                 "label": f"neuron_{idx}", "layer": layer_idx})
+
+    # Sort by strength, keep top 10
+    features.sort(key=lambda f: f["strength"], reverse=True)
+    features = features[:10]
+
+    line = json.dumps({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "tier": tier,
+        "token": token,
+        "token_idx": token_idx,
+        "session_id": session_id or "",
+        "features": features,
+    })
+
+    try:
+        log_path = os.environ.get("ACTIVATION_STREAM_PATH", "/logs/activation_stream.jsonl")
+        with open(log_path, "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass  # Never crash inference for visualization
+
+
 # ── Static KV Cache ──────────────────────────────────────────────────────────
 
 class StaticKVCache:
@@ -425,6 +485,8 @@ class GAIAEngine:
         self.prefix_cache = PrefixCache(self.model, self.tokenizer, device)
         self.monitor = ActivationMonitor()
         self.thoughts = ThoughtManager()
+        self._sae_atlas = None
+        self._sae_labels: Dict[int, Dict[int, str]] = {}  # {layer_idx: {feature_idx: label}}
 
         # Initialize dynamic awareness
         try:
@@ -545,6 +607,63 @@ class GAIAEngine:
             "loaded": list(self._adapters.keys()),
             "base_model": self.model_path,
         }
+
+    def load_sae_atlas(self, path: str) -> dict:
+        """Load pre-trained SAE weights and feature labels for live decomposition.
+
+        Expects a directory with:
+          - meta.json  — model name, timestamp, optional inline labels
+          - layer_N_labels.json — per-layer feature label mappings
+
+        The loaded labels are used by ``_write_activation()`` to annotate
+        features in the JSONL stream with human-readable names.
+        """
+        atlas_path = Path(path)
+        meta_file = atlas_path / "meta.json"
+        labels: Dict[int, Dict[int, str]] = {}
+
+        try:
+            if meta_file.exists():
+                meta = json.loads(meta_file.read_text())
+                # Inline labels in meta.json: {layers: {0: {features: {42: "greeting"}}}}
+                for layer_key, layer_data in meta.get("layers", {}).items():
+                    try:
+                        layer_idx = int(layer_key)
+                        features = layer_data.get("features", {})
+                        labels[layer_idx] = {int(k): v for k, v in features.items()}
+                    except (ValueError, AttributeError):
+                        continue
+
+            # Per-layer label files override meta.json
+            for entry in atlas_path.iterdir():
+                if entry.name.startswith("layer_") and entry.name.endswith("_labels.json"):
+                    try:
+                        layer_idx = int(entry.name.split("_")[1])
+                        layer_labels = json.loads(entry.read_text())
+                        if layer_idx not in labels:
+                            labels[layer_idx] = {}
+                        labels[layer_idx].update({int(k): v for k, v in layer_labels.items()})
+                    except (ValueError, json.JSONDecodeError):
+                        continue
+
+            # Load SAE .pt weights if present
+            sae_weights = {}
+            for entry in atlas_path.iterdir():
+                if entry.suffix == ".pt":
+                    try:
+                        sae_weights[entry.stem] = torch.load(entry, map_location="cpu", weights_only=True)
+                    except Exception as e:
+                        logger.warning("Failed to load SAE weights %s: %s", entry.name, e)
+
+            self._sae_atlas = sae_weights if sae_weights else None
+            self._sae_labels = labels
+            logger.info("SAE atlas loaded from %s: %d layers with labels, %d weight files",
+                        path, len(labels), len(sae_weights))
+            return {"ok": True, "layers": len(labels), "weights": len(sae_weights)}
+
+        except Exception as e:
+            logger.warning("Failed to load SAE atlas from %s: %s", path, e)
+            return {"ok": False, "error": str(e)}
 
     def generate(self, messages: list, max_tokens: int = 512,
                  temperature: float = 0.7, top_p: float = 0.9,
@@ -780,11 +899,16 @@ class GAIAEngine:
             }
 
     def generate_stream(self, messages: list, max_tokens: int = 512,
-                         temperature: float = 0.7, top_p: float = 0.9):
+                         temperature: float = 0.7, top_p: float = 0.9,
+                         session_id: str = ""):
         """Generate a chat completion with per-token streaming.
 
         Yields dicts with delta content for each token, compatible with
         the OpenAI SSE streaming format. Final yield has finish_reason.
+
+        When the activation monitor is enabled, also writes per-token
+        activation snapshots to ``/logs/activation_stream.jsonl`` for
+        the Neural Mind Map visualization.
         """
         # Reuse the same setup as generate() — build input_ids and KV cache
         # This is a simplified version that skips prefix cache for streaming
@@ -818,10 +942,22 @@ class GAIAEngine:
             except Exception:
                 pass
 
+            # Activation streaming setup
+            _capture = self.monitor.enabled
+            _tier = os.environ.get("GAIA_ENGINE_TIER", "core")
+
             with torch.no_grad():
-                out = self.model(input_ids, use_cache=True)
+                out = self.model(input_ids, use_cache=True,
+                                 output_hidden_states=_capture)
             current_kv = out.past_key_values
             logits = out.logits[:, -1, :]
+
+            # Capture initial hidden states if monitor enabled
+            if _capture and hasattr(out, "hidden_states") and out.hidden_states:
+                snapshot = self.monitor.capture(out.hidden_states)
+                if snapshot:
+                    _write_activation(_tier, "<prompt>", 0, session_id,
+                                      snapshot, self._sae_atlas, self._sae_labels)
 
             generated = []
             gen_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
@@ -860,11 +996,20 @@ class GAIAEngine:
                         "choices": [{"delta": {"content": delta}, "finish_reason": None}],
                     }
 
-                # Forward single token
+                # Forward single token — with hidden states for activation stream
                 with torch.no_grad():
-                    out = self.model(next_id, past_key_values=current_kv, use_cache=True)
+                    out = self.model(next_id, past_key_values=current_kv,
+                                     use_cache=True, output_hidden_states=_capture)
                 current_kv = out.past_key_values
                 logits = out.logits[:, -1, :]
+
+                # Write activation snapshot for this token
+                if _capture and hasattr(out, "hidden_states") and out.hidden_states:
+                    snapshot = self.monitor.capture(out.hidden_states)
+                    if snapshot:
+                        _write_activation(_tier, delta or self.tokenizer.decode([token]),
+                                          step + 1, session_id,
+                                          snapshot, self._sae_atlas, self._sae_labels)
 
             self._request_count += 1
             self._total_tokens += len(generated)

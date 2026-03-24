@@ -14,13 +14,13 @@ Each container imports this library and serves one model through it.
 """
 
 from gaia_engine.core import GAIAEngine, serve
-from gaia_engine.manager import EngineManager, serve_managed, set_event_logger
+from gaia_engine.manager import EngineManager, serve_managed
 from gaia_engine.thought_composer import compose_thoughts, estimate_composed_size
 
 __version__ = "1.0.0"
 
 __all__ = [
     "GAIAEngine", "serve",
-    "EngineManager", "serve_managed", "set_event_logger",
+    "EngineManager", "serve_managed",
     "compose_thoughts", "estimate_composed_size",
 ]

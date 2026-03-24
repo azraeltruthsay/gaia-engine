@@ -67,13 +67,15 @@ def _wait_for_health(port: int, timeout: int = 180) -> bool:
 class EngineManager:
     """Zero-GPU engine manager with subprocess isolation."""
 
-    def __init__(self, port: int, host: str = "0.0.0.0", max_concurrent: int = 1):
+    def __init__(self, port: int, host: str = "0.0.0.0", max_concurrent: int = 1,
+                 event_callback=None):
         self.port = port
         self.host = host
         self.worker_process = None
         self.worker_port = None
         self.model_path = None
         self.device = None
+        self.event_callback = event_callback
         self._lock = threading.Lock()
         # Inference queue: limits concurrent requests to the worker.
         # Additional requests block until a slot opens. Prevents overwhelming
@@ -157,9 +159,9 @@ class EngineManager:
             logger.info("Worker killed — model %s unloaded, GPU memory freed", old_model)
 
             try:
-                if _event_logger: pass  # callback pattern
-                log_event("engine", f"Model unloaded: {old_model}",
-                          source="engine_manager", details={"caller": caller[:200]})
+                if self.event_callback:
+                    self.event_callback("engine", f"Model unloaded: {old_model}",
+                                        source="engine_manager", details={"caller": caller[:200]})
             except Exception:
                 pass
             return {"ok": True, "message": "model unloaded", "old_model": old_model}
@@ -214,10 +216,10 @@ class EngineManager:
                 exit_code = self.worker_process.returncode
                 logger.error("Worker process died (exit code %d) — this causes 'silent unload'", exit_code)
                 try:
-                    if _event_logger: pass  # callback pattern
-                    log_event("engine", f"Worker CRASHED (exit code {exit_code})",
-                              source="engine_manager",
-                              details={"model": self.model_path, "exit_code": exit_code})
+                    if self.event_callback:
+                        self.event_callback("engine", f"Worker CRASHED (exit code {exit_code})",
+                                            source="engine_manager",
+                                            details={"model": self.model_path, "exit_code": exit_code})
                 except Exception:
                     pass
                 with self._lock:

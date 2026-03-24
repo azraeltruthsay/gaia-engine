@@ -15,13 +15,13 @@ Not a general-purpose inference server. Optimized for single-user, single-GPU de
 - **ROME Editing** — Rank-One Model Editing for surgical weight corrections.
 - **GPU Lifecycle** — Unified state machine (AWAKE/FOCUSING/SLEEP/DEEP_SLEEP/MEDITATION) with automatic tier management.
 - **GPTQ/NF4/int8** — Automatic quantization detection and loading.
+- **SSE Streaming** — True per-token streaming via manager proxy passthrough.
 
 ## Quick Start
 
 ```python
 from gaia_engine import GAIAEngine, serve
 
-# Direct usage
 engine = GAIAEngine("/models/Qwen3.5-2B", device="cuda")
 result = engine.generate(
     messages=[{"role": "user", "content": "Who are you?"}],
@@ -37,7 +37,7 @@ serve("/models/Qwen3.5-2B", port=8092)
 
 ```bash
 # Start with zero GPU footprint
-python -m gaia_engine --managed --port 8092
+gaia-engine --managed --port 8092
 
 # Load model via HTTP
 curl -X POST http://localhost:8092/model/load \
@@ -63,6 +63,9 @@ pip install gaia-engine[gptq]
 
 # With vision support
 pip install gaia-engine[vision]
+
+# With training support (datasets, trl)
+pip install gaia-engine[training]
 
 # Everything
 pip install gaia-engine[all]

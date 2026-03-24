@@ -27,19 +27,22 @@ dependencies = [
     "accelerate",
     "peft",
     "bitsandbytes",
-    "optimum-quanto",
-    "optimum",
+    "Pillow",
+    "numpy",
+    "safetensors",
     "sentencepiece",
     "protobuf",
-    "Pillow",
-    "pydantic>=2.0",
 ]
 
 [project.optional-dependencies]
 gptq = ["gptqmodel"]
 vision = ["torchvision", "qwen-vl-utils"]
-all = ["gaia-engine[gptq,vision]"]
+training = ["datasets", "trl"]
+all = ["gaia-engine[gptq,vision,training]"]
 dev = ["pytest", "ruff", "mypy"]
+
+[project.scripts]
+gaia-engine = "gaia_engine.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/azraeltruthsay/gaia-engine"

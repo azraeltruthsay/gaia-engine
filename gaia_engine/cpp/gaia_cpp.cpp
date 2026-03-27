@@ -40,12 +40,14 @@ namespace py = pybind11;
 
 // ── GenerateResult ────────────────────────────────────────────────────────────
 
+// Internal result uses raw C++ vectors — no Python objects.
+// Converted to numpy in the pybind11 wrappers AFTER re-acquiring the GIL.
 struct GenerateResult {
     std::string text;
     int prompt_tokens = 0;
     int completion_tokens = 0;
-    // {layer_idx → numpy array shape (n_embd,), dtype=float32}
-    std::unordered_map<int, py::array_t<float>> hidden_states;
+    // {layer_idx → raw float vector}, converted to numpy after GIL re-acquisition
+    std::unordered_map<int, std::vector<float>> hidden_states;
 };
 
 // ── LlamaCppBackend ───────────────────────────────────────────────────────────
@@ -307,18 +309,14 @@ private:
 
         llama_sampler_free(sampler);
 
-        // ── Extract captured hidden states → numpy arrays ─────────────────
+        // ── Extract captured hidden states → raw vectors ─────────────────
+        // Stored as C++ vectors here; converted to numpy in pybind11 wrappers
+        // AFTER the GIL is re-acquired (py::array_t requires the GIL).
         if (capture_hidden) {
             std::lock_guard<std::mutex> lk(capture_state_.mtx);
             for (auto& [layer_idx, cap] : capture_state_.captures) {
                 if (cap.data.empty()) continue;
-
-                // Create numpy array view over the captured data (copy to be safe)
-                auto arr = py::array_t<float>({static_cast<ssize_t>(cap.n_embd)});
-                auto buf = arr.request();
-                std::memcpy(buf.ptr, cap.data.data(),
-                            static_cast<size_t>(cap.n_embd) * sizeof(float));
-                result.hidden_states[layer_idx] = std::move(arr);
+                result.hidden_states[layer_idx] = std::move(cap.data);
             }
         }
 
@@ -333,6 +331,22 @@ private:
 
 // ── pybind11 module ───────────────────────────────────────────────────────────
 
+// Convert raw C++ hidden states to Python dict of numpy arrays.
+// MUST be called with the GIL held (which pybind11 guarantees in def lambdas).
+static py::dict _hidden_states_to_numpy(
+    const std::unordered_map<int, std::vector<float>>& hidden_states
+) {
+    py::dict result;
+    for (const auto& [layer_idx, vec] : hidden_states) {
+        if (vec.empty()) continue;
+        auto arr = py::array_t<float>(static_cast<ssize_t>(vec.size()));
+        auto buf = arr.request();
+        std::memcpy(buf.ptr, vec.data(), vec.size() * sizeof(float));
+        result[py::int_(layer_idx)] = std::move(arr);
+    }
+    return result;
+}
+
 PYBIND11_MODULE(gaia_cpp, m) {
     m.doc() = "gaia_cpp — in-process llama.cpp backend for GAIA Engine";
 
@@ -340,7 +354,10 @@ PYBIND11_MODULE(gaia_cpp, m) {
         .def_readonly("text",              &GenerateResult::text)
         .def_readonly("prompt_tokens",     &GenerateResult::prompt_tokens)
         .def_readonly("completion_tokens", &GenerateResult::completion_tokens)
-        .def_readonly("hidden_states",     &GenerateResult::hidden_states);
+        .def_property_readonly("hidden_states", [](const GenerateResult& r) {
+            // Convert raw float vectors → numpy arrays (GIL is held here)
+            return _hidden_states_to_numpy(r.hidden_states);
+        });
 
     py::class_<LlamaCppBackend>(m, "LlamaCppBackend")
         .def(py::init<const std::string&, int, std::vector<int>, int, int>(),
@@ -358,9 +375,17 @@ PYBIND11_MODULE(gaia_cpp, m) {
                float top_p,
                int top_k,
                bool capture_hidden) {
-                // Release GIL for C++ inference (may take seconds)
-                py::gil_scoped_release release;
-                return self.generate(prompt, max_tokens, temperature, top_p, top_k, capture_hidden);
+                // pybind11 holds the GIL when entering this lambda.
+                // Release it during the C++ inference loop so other Python
+                // threads can run. The GIL is re-acquired when the
+                // py::gil_scoped_release destructor fires, before we
+                // return the result to Python for conversion.
+                GenerateResult result;
+                {
+                    py::gil_scoped_release release;
+                    result = self.generate(prompt, max_tokens, temperature, top_p, top_k, capture_hidden);
+                }
+                return result;
             },
             py::arg("prompt"),
             py::arg("max_tokens")     = 512,
@@ -378,16 +403,22 @@ PYBIND11_MODULE(gaia_cpp, m) {
                float top_p,
                int top_k,
                bool capture_hidden) {
-                // Wrap the Python callable so it re-acquires the GIL
-                // before calling back into Python, while the main inference
-                // loop runs with the GIL released.
+                // The token callback fires from C++ while the GIL is released.
+                // It must re-acquire the GIL to call back into Python.
+                // py::gil_scoped_acquire is the pybind11-native way to do this.
                 auto cpp_callback = [&token_callback](const std::string& delta) {
                     py::gil_scoped_acquire acquire;
-                    token_callback(delta);
+                    try {
+                        token_callback(py::cast(delta));
+                    } catch (...) {}
                 };
-                py::gil_scoped_release release;
-                return self.generate_stream(
-                    prompt, cpp_callback, max_tokens, temperature, top_p, top_k, capture_hidden);
+                GenerateResult result;
+                {
+                    py::gil_scoped_release release;
+                    result = self.generate_stream(
+                        prompt, cpp_callback, max_tokens, temperature, top_p, top_k, capture_hidden);
+                }
+                return result;
             },
             py::arg("prompt"),
             py::arg("token_callback"),

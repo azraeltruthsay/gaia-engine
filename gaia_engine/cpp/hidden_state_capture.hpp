@@ -6,8 +6,9 @@
 // llama_decode(). We filter by tensor name to capture per-layer block outputs.
 //
 // Tensor naming in llama.cpp b8250 for Qwen2/Qwen3/Qwen3MoE:
-//   "blk.N.l_out" — post-FFN residual (full transformer block output, layer N)
-//   This corresponds to hidden_states[N+1] in transformers library.
+//   "l_out-N"   — post-FFN residual (b8250+ new format, e.g. "l_out-0")
+//   "blk.N.l_out" — same tensor, older llama.cpp format (kept for compat)
+//   Both correspond to hidden_states[N+1] in transformers library.
 //
 // The callback uses ask/answer protocol:
 //   ask=true  → "do you want this tensor's data?" return true to allow, false to skip
@@ -60,40 +61,57 @@ struct HiddenStateCaptureState {
 // Called by ggml scheduler for every tensor op in the computation graph.
 // Must be fast — this runs on the critical path during every forward pass.
 
-static bool gaia_cb_eval(struct ggml_tensor* t, bool ask, void* user_data) {
-    // ask=true: scheduler asking if we want the tensor's data computed/synced.
-    // Returning true = "yes, proceed normally."
-    // We always return true — we never skip ops.
-    if (ask) return true;
-
-    // ask=false: tensor data is ready in backend memory.
-    auto* state = reinterpret_cast<HiddenStateCaptureState*>(user_data);
-    if (!state->active.load(std::memory_order_relaxed)) return true;
-    if (state->capture_layers.empty()) return true;
-
-    const char* name = t->name;
-
-    // Fast prefix check: must start with "blk."
-    if (name[0] != 'b' || name[1] != 'l' || name[2] != 'k' || name[3] != '.') {
-        return true;
-    }
-
-    // Parse layer index: "blk.N.l_out"
-    const char* p = name + 4;
+// Parse tensor name to extract layer index. Returns -1 if not a block output tensor.
+// Supports both "l_out-N" (b8250+) and "blk.N.l_out" (older) formats.
+static inline int _parse_layer_from_name(const char* name) {
+    const char* p;
     int layer = 0;
     bool has_digit = false;
-    while (*p >= '0' && *p <= '9') {
-        layer = layer * 10 + (*p - '0');
-        ++p;
-        has_digit = true;
+
+    if (name[0] == 'l' && name[1] == '_' && name[2] == 'o' &&
+        name[3] == 'u' && name[4] == 't' && name[5] == '-') {
+        // "l_out-N"
+        p = name + 6;
+        while (*p >= '0' && *p <= '9') {
+            layer = layer * 10 + (*p - '0');
+            ++p;
+            has_digit = true;
+        }
+        if (!has_digit || *p != '\0') return -1;
+        return layer;
     }
-    if (!has_digit || *p != '.') return true;
-    ++p;  // skip '.'
 
-    // Only "l_out" tensors
-    if (strcmp(p, "l_out") != 0) return true;
+    if (name[0] == 'b' && name[1] == 'l' && name[2] == 'k' && name[3] == '.') {
+        // "blk.N.l_out"
+        p = name + 4;
+        while (*p >= '0' && *p <= '9') {
+            layer = layer * 10 + (*p - '0');
+            ++p;
+            has_digit = true;
+        }
+        if (!has_digit || *p != '.') return -1;
+        ++p;
+        if (strcmp(p, "l_out") != 0) return -1;
+        return layer;
+    }
 
-    // Check if this layer is in the capture set (small vector, linear scan is fine)
+    return -1;
+}
+
+static bool gaia_cb_eval(struct ggml_tensor* t, bool ask, void* user_data) {
+    auto* state = reinterpret_cast<HiddenStateCaptureState*>(user_data);
+
+    // Fast exit: if capture is not active, don't request any tensor data.
+    // Returning false for ask=true means "I don't need this tensor's data synced."
+    // The computation still happens — we just skip the host-memory sync.
+    if (!state->active.load(std::memory_order_relaxed)) return false;
+    if (state->capture_layers.empty()) return false;
+
+    // Parse tensor name — reject non-block-output tensors immediately
+    int layer = _parse_layer_from_name(t->name);
+    if (layer < 0) return false;
+
+    // Check if this layer is in the capture set
     bool should_capture = false;
     for (int cl : state->capture_layers) {
         if (cl == layer) {
@@ -101,7 +119,11 @@ static bool gaia_cb_eval(struct ggml_tensor* t, bool ask, void* user_data) {
             break;
         }
     }
-    if (!should_capture) return true;
+    if (!should_capture) return false;
+
+    // ask=true: scheduler asking if we want this tensor's data synced to host.
+    // Return true only for tensors we actually want to capture.
+    if (ask) return true;
 
     // Tensor shape in ggml (column-major): [n_embd, n_tokens, 1, 1]
     //   ne[0] = n_embd (embedding dimension)
@@ -109,7 +131,7 @@ static bool gaia_cb_eval(struct ggml_tensor* t, bool ask, void* user_data) {
     //   nb[1] = byte stride between tokens (= n_embd * element_size for packed)
     int64_t n_embd = t->ne[0];
     int64_t n_tokens = t->ne[1];
-    if (n_embd <= 0 || n_tokens <= 0) return true;
+    if (n_embd <= 0 || n_tokens <= 0) return false;
 
     // We want the LAST token's hidden state (most recently predicted position)
     int64_t last_tok = n_tokens - 1;
@@ -157,7 +179,7 @@ static bool gaia_cb_eval(struct ggml_tensor* t, bool ask, void* user_data) {
     } else {
         // Unsupported type (e.g., Q8_0 activations — shouldn't happen for l_out)
         // Dequant is complex; skip and log
-        return true;
+        return false;
     }
 
     {

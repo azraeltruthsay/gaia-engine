@@ -23,7 +23,8 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger("GAIA.Awareness")
 
-AWARENESS_DIR = Path(os.environ.get("AWARENESS_DIR", "/knowledge/awareness"))
+from gaia_engine.config import AWARENESS_DIR as _AWARENESS_DIR_STR
+AWARENESS_DIR = Path(_AWARENESS_DIR_STR)
 
 # Relevance categories with base weights
 # Higher weight = more likely to be included in the awareness segment

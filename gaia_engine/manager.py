@@ -108,9 +108,10 @@ class EngineManager:
                 # GGUF: try gaia_cpp in-process backend first (hidden states + speed)
                 # Falls back to llama-server subprocess if unavailable.
                 n_gpu_layers = 999 if device == "cuda" else 0
-                ctx_size = int(os.environ.get("GGUF_CTX_SIZE", "4096"))
-                threads = int(os.environ.get("GGUF_THREADS", "8"))
-                tier = os.environ.get("GAIA_ENGINE_TIER", "prime")
+                from gaia_engine.config import GGUF_CTX_SIZE, GGUF_THREADS, ENGINE_TIER
+                ctx_size = GGUF_CTX_SIZE
+                threads = GGUF_THREADS
+                tier = ENGINE_TIER
 
                 try:
                     from gaia_engine.cpp import is_available, GaiaCppBackendAdapter
@@ -613,7 +614,12 @@ class ManagedEngineHandler(BaseHTTPRequestHandler):
             self.manager._inference_semaphore.release()
 
     def _proxy_stream_cpp(self, body: bytes, cpp):
-        """Stream SSE directly from gaia_cpp in-process backend."""
+        """Stream SSE directly from gaia_cpp in-process backend.
+
+        Uses generate_stream_sse() in direct (write_fn) mode — no daemon thread.
+        Runs on the HTTP handler thread (which has valid GIL state) so pybind11's
+        py::gil_scoped_release works without crashing on Python 3.11.
+        """
         acquired = self.manager._inference_semaphore.acquire(timeout=120)
         if not acquired:
             self._json({"error": "inference queue full"}, 429)
@@ -632,11 +638,14 @@ class ManagedEngineHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
 
-            for chunk_bytes in cpp.generate_stream_sse(
-                messages, max_tokens, temperature, top_p, session_id
-            ):
-                self.wfile.write(chunk_bytes)
+            def write_fn(data: bytes) -> None:
+                self.wfile.write(data)
                 self.wfile.flush()
+
+            cpp.stream_to_writer(
+                messages, max_tokens, temperature, top_p, session_id,
+                write_fn=write_fn,
+            )
 
         except Exception as e:
             logger.warning("cpp stream error: %s", e)
@@ -664,8 +673,15 @@ class ManagedEngineHandler(BaseHTTPRequestHandler):
 
 class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     """Threaded HTTP server so long-running requests (model load/unload)
-    don't block health probes and other concurrent requests."""
-    daemon_threads = True
+    don't block health probes and other concurrent requests.
+
+    daemon_threads=False: handler threads must NOT be daemon threads.
+    pybind11's py::gil_scoped_release calls PyEval_SaveThread() which
+    requires a non-NULL Python thread state. On Python 3.11, daemon
+    threads can have a NULL thread state, causing a fatal crash.
+    Using non-daemon threads keeps the thread state valid throughout.
+    """
+    daemon_threads = False
 
 
 def serve_managed(port: int = 8092, host: str = "0.0.0.0"):

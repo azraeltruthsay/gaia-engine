@@ -28,12 +28,20 @@ import threading
 import uuid
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
+from urllib.parse import urlparse, parse_qs
 
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 logger = logging.getLogger("GAIA.Engine")
+
+# ── Performance: configurable SAE sample rate ────────────────────────────────
+from gaia_engine.config import SAE_SAMPLE_RATE as _SAE_SAMPLE_RATE
+from gaia_engine.config import SAE_STREAM_EVERY_N as _SAE_STREAM_EVERY_N
+
+# Disable gradient computation globally for inference (not just per-call)
+torch.set_grad_enabled(False)
 
 
 # ── Activation JSONL Writer ──────────────────────────────────────────────────
@@ -88,7 +96,8 @@ def _write_activation(tier, token, token_idx, session_id, snapshot, sae=None, la
     })
 
     try:
-        log_path = os.environ.get("ACTIVATION_STREAM_PATH", "/logs/activation_stream.jsonl")
+        from gaia_engine.config import ACTIVATION_STREAM_PATH
+        log_path = ACTIVATION_STREAM_PATH
         with open(log_path, "a") as f:
             f.write(line + "\n")
     except Exception:
@@ -153,28 +162,56 @@ class ActivationMonitor:
         self._last_timestamp: float = 0.0
         self._captures: int = 0
 
-    def capture(self, hidden_states: tuple, sample_every: int = 4) -> dict:
+    def capture(self, hidden_states: tuple, sample_every: int = None) -> dict:
+        """Capture activation snapshot from selected layers.
+
+        Args:
+            hidden_states: Tuple of hidden states from the model forward pass.
+                Can be the full tuple or a pre-filtered dict {layer_idx: tensor}.
+            sample_every: Layer sampling interval. Defaults to _SAE_SAMPLE_RATE env var.
+        """
         if not self.enabled or hidden_states is None:
             return {}
 
+        if sample_every is None:
+            sample_every = _SAE_SAMPLE_RATE
+
         self._captures += 1
         self._last_timestamp = time.time()
-        num_layers = len(hidden_states)
 
         snapshot = {}
-        sample_layers = [0] + list(range(sample_every, num_layers - 1, sample_every)) + [num_layers - 1]
 
-        for idx in sample_layers:
-            if idx >= num_layers:
-                continue
-            last_token = hidden_states[idx][0, -1, :]
-            snapshot[f"layer_{idx}"] = {
-                "mean": float(last_token.mean()),
-                "std": float(last_token.std()),
-                "l2_norm": float(last_token.norm()),
-                "top_5_indices": last_token.abs().topk(5).indices.tolist(),
-                "top_5_values": [round(float(v), 4) for v in last_token.abs().topk(5).values],
-            }
+        if isinstance(hidden_states, dict):
+            # Pre-filtered dict from selective capture: {layer_idx: tensor}
+            for idx, hs in hidden_states.items():
+                last_token = hs[0, -1, :]
+                abs_vals = last_token.abs()
+                top5 = abs_vals.topk(5)
+                snapshot[f"layer_{idx}"] = {
+                    "mean": float(last_token.mean()),
+                    "std": float(last_token.std()),
+                    "l2_norm": float(last_token.norm()),
+                    "top_5_indices": top5.indices.tolist(),
+                    "top_5_values": [round(float(v), 4) for v in top5.values],
+                }
+        else:
+            # Full tuple — sample every Nth layer
+            num_layers = len(hidden_states)
+            sample_layers = [0] + list(range(sample_every, num_layers - 1, sample_every)) + [num_layers - 1]
+
+            for idx in sample_layers:
+                if idx >= num_layers:
+                    continue
+                last_token = hidden_states[idx][0, -1, :]
+                abs_vals = last_token.abs()
+                top5 = abs_vals.topk(5)
+                snapshot[f"layer_{idx}"] = {
+                    "mean": float(last_token.mean()),
+                    "std": float(last_token.std()),
+                    "l2_norm": float(last_token.norm()),
+                    "top_5_indices": top5.indices.tolist(),
+                    "top_5_values": [round(float(v), 4) for v in top5.values],
+                }
 
         self._last_snapshot = snapshot
         return snapshot
@@ -281,11 +318,10 @@ class PrefixCache:
         text = f"<|im_start|>system\n{prefix}<|im_end|>\n"
         ids = self.tokenizer.encode(text, return_tensors="pt").to(self.device)
 
-        with torch.no_grad():
-            out = self.model(ids, use_cache=True)
-            self._cached_kv = out.past_key_values
-            self._cached_len = ids.shape[1]
-            self._hashes = current_hashes
+        out = self.model(ids, use_cache=True)
+        self._cached_kv = out.past_key_values
+        self._cached_len = ids.shape[1]
+        self._hashes = current_hashes
 
         logger.info("KV prefix recomputed (%d tokens, segments: %s)",
                      self._cached_len, list(self._hashes.keys()))
@@ -426,6 +462,7 @@ class GAIAEngine:
                     quantization_config=nf4_config,
                     device_map={"": "cpu"},
                     low_cpu_mem_usage=True,
+                    attn_implementation="sdpa",
                 )
                 # Move quantized model to GPU via accelerate
                 from accelerate import dispatch_model, infer_auto_device_map
@@ -443,17 +480,20 @@ class GAIAEngine:
                 try:
                     self.model = AutoModelForImageTextToText.from_pretrained(
                         model_path, trust_remote_code=True, dtype=dtype,
+                        attn_implementation="sdpa",
                     )
                     logger.info("Loaded as vision-language model")
                 except Exception:
                     from transformers import AutoModel
                     self.model = AutoModel.from_pretrained(
                         model_path, trust_remote_code=True, dtype=dtype,
+                        attn_implementation="sdpa",
                     )
                     logger.info("Loaded as generic model")
             else:
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_path, trust_remote_code=True, dtype=dtype,
+                    attn_implementation="sdpa",
                 )
 
         # Move bf16 model to GPU (skip if NF4 already loaded on GPU)
@@ -487,6 +527,16 @@ class GAIAEngine:
         self.thoughts = ThoughtManager()
         self._sae_atlas = None
         self._sae_labels: Dict[int, Dict[int, str]] = {}  # {layer_idx: {feature_idx: label}}
+
+        # SAE target layers — only extract these from hidden_states to save memory
+        # Default: every _SAE_SAMPLE_RATE-th layer plus first and last
+        _num_layers = getattr(self.model.config, 'num_hidden_layers',
+                              getattr(getattr(self.model.config, 'text_config', None), 'num_hidden_layers', 32))
+        self._sae_target_layers = set(
+            [0] + list(range(_SAE_SAMPLE_RATE, _num_layers - 1, _SAE_SAMPLE_RATE)) + [_num_layers - 1]
+        )
+        logger.info("SAE target layers: %s (sample_rate=%d, stream_every_n=%d)",
+                     sorted(self._sae_target_layers), _SAE_SAMPLE_RATE, _SAE_STREAM_EVERY_N)
 
         # Initialize dynamic awareness
         try:
@@ -665,6 +715,25 @@ class GAIAEngine:
             logger.warning("Failed to load SAE atlas from %s: %s", path, e)
             return {"ok": False, "error": str(e)}
 
+    def _extract_target_hidden_states(self, hidden_states) -> Optional[dict]:
+        """Extract only the SAE target layers from hidden_states tuple, freeing the rest.
+
+        Returns a dict {layer_idx: tensor} containing only the layers we need
+        for SAE monitoring, or None if hidden_states is empty/None.
+        This avoids keeping all 32+ layers in memory during generation.
+        """
+        if hidden_states is None:
+            return None
+        num_layers = len(hidden_states)
+        if num_layers == 0:
+            return None
+        result = {}
+        for idx in self._sae_target_layers:
+            if idx < num_layers:
+                # Detach and clone the single tensor we need (last token only)
+                result[idx] = hidden_states[idx][:, -1:, :].detach()
+        return result if result else None
+
     def generate(self, messages: list, max_tokens: int = 512,
                  temperature: float = 0.7, top_p: float = 0.9,
                  skip_prefix: bool = False) -> dict:
@@ -681,8 +750,9 @@ class GAIAEngine:
 
             # Compute current time (used by both modes)
             try:
-                _tz_offset = int(os.environ.get("GAIA_LOCAL_TZ_OFFSET", "-7"))
-                _tz_label = os.environ.get("GAIA_LOCAL_TZ_LABEL", "PDT")
+                from gaia_engine.config import LOCAL_TZ_OFFSET, LOCAL_TZ_LABEL
+                _tz_offset = LOCAL_TZ_OFFSET
+                _tz_label = LOCAL_TZ_LABEL
                 local_tz = timezone(timedelta(hours=_tz_offset))
                 now_utc = datetime.now(timezone.utc)
                 now_local = now_utc.astimezone(local_tz)
@@ -819,14 +889,15 @@ class GAIAEngine:
 
             # First forward — process input + capture activations
             capture = self.monitor.enabled
-            with torch.no_grad():
-                out = self.model(input_ids, past_key_values=current_kv,
-                                  use_cache=True, output_hidden_states=capture)
+            out = self.model(input_ids, past_key_values=current_kv,
+                              use_cache=True, output_hidden_states=capture)
             current_kv = out.past_key_values
             logits = out.logits[:, -1, :]
 
             if capture and hasattr(out, "hidden_states") and out.hidden_states:
-                self.monitor.capture(out.hidden_states)
+                filtered = self._extract_target_hidden_states(out.hidden_states)
+                self.monitor.capture(filtered)
+            del out  # Free full output immediately
 
             # Autoregressive loop — minimal overhead, with entropy tracking
             eos_id = self.tokenizer.eos_token_id
@@ -843,24 +914,31 @@ class GAIAEngine:
                 if 0 <= _think_token_id < logits.shape[-1]:
                     logits[0, _think_token_id] = float("-inf")
 
-                # Track per-token entropy (uncertainty signal)
-                probs = F.softmax(logits, dim=-1)
-                log_probs = torch.log(probs + 1e-10)
-                token_entropy = -(probs * log_probs).sum().item()
-                _entropy_sum += token_entropy
-                _entropy_count += 1
-
-                # Sample
+                # Sample with single-pass softmax (avoid redundant computation)
                 if temperature > 0:
                     scaled = logits / temperature
                     if top_p < 1.0:
-                        sorted_logits, sorted_idx = torch.sort(scaled, descending=True)
-                        cumprobs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                        mask = (cumprobs - F.softmax(sorted_logits, dim=-1)) >= top_p
-                        sorted_logits[mask] = float("-inf")
-                        logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
-                    next_id = torch.multinomial(F.softmax(logits, dim=-1), 1)
+                        probs = F.softmax(scaled, dim=-1)
+                        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+                        cumprobs = torch.cumsum(sorted_probs, dim=-1)
+                        mask = (cumprobs - sorted_probs) >= top_p
+                        sorted_probs[mask] = 0.0
+                        sorted_probs /= sorted_probs.sum(dim=-1, keepdim=True)  # renormalize
+                        # Track entropy from the pre-nucleus probs
+                        _entropy_sum += -(probs * torch.log(probs + 1e-10)).sum().item()
+                        _entropy_count += 1
+                        sample_idx = torch.multinomial(sorted_probs, 1)
+                        next_id = sorted_idx.gather(1, sample_idx)
+                    else:
+                        probs = F.softmax(scaled, dim=-1)
+                        _entropy_sum += -(probs * torch.log(probs + 1e-10)).sum().item()
+                        _entropy_count += 1
+                        next_id = torch.multinomial(probs, 1)
                 else:
+                    # Greedy — entropy from raw logits
+                    probs = F.softmax(logits, dim=-1)
+                    _entropy_sum += -(probs * torch.log(probs + 1e-10)).sum().item()
+                    _entropy_count += 1
                     next_id = logits.argmax(dim=-1, keepdim=True)
 
                 token = next_id.item()
@@ -869,10 +947,10 @@ class GAIAEngine:
                 generated.append(token)
 
                 # Forward single token (no hidden states capture for speed)
-                with torch.no_grad():
-                    out = self.model(next_id, past_key_values=current_kv, use_cache=True)
+                out = self.model(next_id, past_key_values=current_kv, use_cache=True)
                 current_kv = out.past_key_values
                 logits = out.logits[:, -1, :]
+                del out
 
             # Decode
             text = self.tokenizer.decode(generated, skip_special_tokens=True)
@@ -944,20 +1022,22 @@ class GAIAEngine:
 
             # Activation streaming setup
             _capture = self.monitor.enabled
-            _tier = os.environ.get("GAIA_ENGINE_TIER", "core")
+            from gaia_engine.config import ENGINE_TIER
+            _tier = ENGINE_TIER
 
-            with torch.no_grad():
-                out = self.model(input_ids, use_cache=True,
-                                 output_hidden_states=_capture)
+            out = self.model(input_ids, use_cache=True,
+                             output_hidden_states=_capture)
             current_kv = out.past_key_values
             logits = out.logits[:, -1, :]
 
             # Capture initial hidden states if monitor enabled
             if _capture and hasattr(out, "hidden_states") and out.hidden_states:
-                snapshot = self.monitor.capture(out.hidden_states)
+                filtered = self._extract_target_hidden_states(out.hidden_states)
+                snapshot = self.monitor.capture(filtered)
                 if snapshot:
                     _write_activation(_tier, "<prompt>", 0, session_id,
                                       snapshot, self._sae_atlas, self._sae_labels)
+            del out  # Free full output immediately
 
             generated = []
             gen_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
@@ -967,16 +1047,20 @@ class GAIAEngine:
                 if 0 <= _think_token_id < logits.shape[-1]:
                     logits[0, _think_token_id] = float("-inf")
 
-                # Sample
+                # Sample — single-pass softmax (no redundant computation)
                 if temperature > 0:
                     scaled = logits / temperature
                     if top_p < 1.0:
-                        sorted_logits, sorted_idx = torch.sort(scaled, descending=True)
-                        cumprobs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                        mask = (cumprobs - F.softmax(sorted_logits, dim=-1)) >= top_p
-                        sorted_logits[mask] = float("-inf")
-                        logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
-                    next_id = torch.multinomial(F.softmax(logits, dim=-1), 1)
+                        probs = F.softmax(scaled, dim=-1)
+                        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+                        cumprobs = torch.cumsum(sorted_probs, dim=-1)
+                        mask = (cumprobs - sorted_probs) >= top_p
+                        sorted_probs[mask] = 0.0
+                        sorted_probs /= sorted_probs.sum(dim=-1, keepdim=True)
+                        sample_idx = torch.multinomial(sorted_probs, 1)
+                        next_id = sorted_idx.gather(1, sample_idx)
+                    else:
+                        next_id = torch.multinomial(F.softmax(scaled, dim=-1), 1)
                 else:
                     next_id = logits.argmax(dim=-1, keepdim=True)
 
@@ -996,20 +1080,22 @@ class GAIAEngine:
                         "choices": [{"delta": {"content": delta}, "finish_reason": None}],
                     }
 
-                # Forward single token — with hidden states for activation stream
-                with torch.no_grad():
-                    out = self.model(next_id, past_key_values=current_kv,
-                                     use_cache=True, output_hidden_states=_capture)
+                # Forward single token — only request hidden states every Nth token
+                _need_hidden = _capture and (step % _SAE_STREAM_EVERY_N == 0)
+                out = self.model(next_id, past_key_values=current_kv,
+                                 use_cache=True, output_hidden_states=_need_hidden)
                 current_kv = out.past_key_values
                 logits = out.logits[:, -1, :]
 
-                # Write activation snapshot for this token
-                if _capture and hasattr(out, "hidden_states") and out.hidden_states:
-                    snapshot = self.monitor.capture(out.hidden_states)
+                # Write activation snapshot for sampled tokens only
+                if _need_hidden and hasattr(out, "hidden_states") and out.hidden_states:
+                    filtered = self._extract_target_hidden_states(out.hidden_states)
+                    snapshot = self.monitor.capture(filtered)
                     if snapshot:
                         _write_activation(_tier, delta or self.tokenizer.decode([token]),
                                           step + 1, session_id,
                                           snapshot, self._sae_atlas, self._sae_labels)
+                del out  # Free output each step
 
             self._request_count += 1
             self._total_tokens += len(generated)
@@ -1220,25 +1306,95 @@ class EngineHandler(BaseHTTPRequestHandler):
             self._json(_engine.adapter_status())
         elif self.path == "/vision/status":
             self._json({"has_vision": _engine.has_vision, "model": _engine.model_path})
+        elif self.path.startswith("/slots"):
+            # llama-server compatible slot API — maps to thought hold/resume
+            self._handle_slot_get()
         else:
             self._json({"error": "not found"}, 404)
+
+    def _handle_slot_get(self):
+        """Handle GET /slots and GET /slots/{id} — return slot/KV cache info."""
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        path_parts = parsed.path.rstrip("/").split("/")
+
+        # GET /slots — list all slots
+        if len(path_parts) <= 2:
+            pc = _engine.prefix_cache
+            cached_len = getattr(pc, "_cached_len", 0)
+            has_kv = getattr(pc, "_cached_kv", None) is not None
+            thoughts = _engine.thoughts.list_all()
+            self._json([{
+                "id": 0,
+                "n_ctx": _engine.max_length if hasattr(_engine, "max_length") else 0,
+                "n_past": cached_len if has_kv else 0,
+                "state": "active" if has_kv else "idle",
+                "held_thoughts": thoughts.get("count", 0),
+            }])
+            return
+
+        # GET /slots/0 — single slot info
+        pc = _engine.prefix_cache
+        cached_len = getattr(pc, "_cached_len", 0)
+        has_kv = getattr(pc, "_cached_kv", None) is not None
+        self._json({
+            "id": 0,
+            "n_ctx": _engine.max_length if hasattr(_engine, "max_length") else 0,
+            "n_past": cached_len if has_kv else 0,
+            "state": "active" if has_kv else "idle",
+        })
+
+    def _handle_slot_post(self):
+        """Handle POST /slots/{id}?action=save|restore|erase — KV cache operations."""
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        action = params.get("action", [""])[0]
+        b = self._body()
+        filename = params.get("filename", [b.get("filename", "")])[0]
+
+        if action == "save":
+            # Map to thought/hold
+            label = filename or f"slot_{int(time.time())}"
+            pc = _engine.prefix_cache
+            result = _engine.thoughts.hold(
+                label, pc._cached_kv, pc._cached_len,
+                list(pc._hashes.values()), b.get("context", ""))
+            self._json(result)
+        elif action == "restore":
+            # Map to thought/resume
+            label = filename or ""
+            t = _engine.thoughts.resume(label)
+            if t:
+                _engine.prefix_cache._cached_kv = t["kv"]
+                _engine.prefix_cache._cached_len = t["meta"]["prefix_tokens"]
+                self._json({"ok": True, "resumed": t["meta"]})
+            else:
+                self._json({"ok": False, "error": f"no saved state with label '{label}'"}, 404)
+        elif action == "erase":
+            # Map to thought/drop — or invalidate cache if no label
+            label = filename
+            if label:
+                ok = _engine.thoughts.drop(label)
+                self._json({"ok": ok})
+            else:
+                _engine.prefix_cache.invalidate()
+                self._json({"ok": True, "message": "KV cache cleared"})
+        else:
+            self._json({"error": f"unknown action: {action}"}, 400)
 
     def do_POST(self):
         if self.path == "/v1/chat/completions":
             try:
                 b = self._body()
                 stream = b.get("stream", False)
-                result = _engine.generate(
-                    b.get("messages", []), b.get("max_tokens", 512),
-                    b.get("temperature", 0.7), b.get("top_p", 0.9),
-                    skip_prefix=b.get("skip_prefix", False))
 
                 if stream:
-                    # True per-token SSE streaming
+                    # True per-token SSE streaming — no Transfer-Encoding
+                    # header since BaseHTTPHandler writes raw SSE lines
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
                     self.send_header("Cache-Control", "no-cache")
-                    self.send_header("Transfer-Encoding", "chunked")
+                    self.send_header("Connection", "close")
                     self.end_headers()
 
                     for chunk in _engine.generate_stream(
@@ -1249,6 +1405,10 @@ class EngineHandler(BaseHTTPRequestHandler):
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
                 else:
+                    result = _engine.generate(
+                        b.get("messages", []), b.get("max_tokens", 512),
+                        b.get("temperature", 0.7), b.get("top_p", 0.9),
+                        skip_prefix=b.get("skip_prefix", False))
                     self._json(result)
             except Exception as e:
                 logger.exception("Generation failed")
@@ -1532,6 +1692,10 @@ class EngineHandler(BaseHTTPRequestHandler):
                     },
                     "uptime_s": round(time.time() - _engine._started_at, 1),
                 })
+
+        elif self.path.startswith("/slots"):
+            # llama-server compatible slot API — maps to thought hold/resume
+            self._handle_slot_post()
 
         else:
             self._json({"error": "not found"}, 404)

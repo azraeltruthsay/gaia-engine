@@ -33,6 +33,7 @@ import sys
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
@@ -84,6 +85,8 @@ class EngineManager:
         self._inference_semaphore = threading.Semaphore(max_concurrent)
         self._worker_stdout_thread = None
         self._worker_stderr_thread = None
+        # gaia_cpp in-process backend (set when backend='cpp')
+        self._cpp_backend = None
 
     def start_worker(self, model_path: str, device: str = "cuda",
                      compile_mode: str = "reduce-overhead",
@@ -102,10 +105,36 @@ class EngineManager:
             is_gguf = model_path.lower().endswith('.gguf')
 
             if is_gguf:
-                # GGUF: use llama-server (C++ inference, much faster on CPU)
+                # GGUF: try gaia_cpp in-process backend first (hidden states + speed)
+                # Falls back to llama-server subprocess if unavailable.
                 n_gpu_layers = 999 if device == "cuda" else 0
                 ctx_size = int(os.environ.get("GGUF_CTX_SIZE", "4096"))
                 threads = int(os.environ.get("GGUF_THREADS", "8"))
+                tier = os.environ.get("GAIA_ENGINE_TIER", "prime")
+
+                try:
+                    from gaia_engine.cpp import is_available, GaiaCppBackendAdapter
+                    if is_available():
+                        cpp = GaiaCppBackendAdapter(
+                            model_path,
+                            n_gpu_layers=n_gpu_layers,
+                            n_ctx=ctx_size,
+                            n_threads=threads,
+                            tier=tier,
+                        )
+                        self._cpp_backend = cpp
+                        self.worker_port = None
+                        self.model_path = model_path
+                        self.device = device
+                        self.backend = 'cpp'
+                        logger.info("GGUF loaded via gaia_cpp (in-process, gpu_layers=%d): %s",
+                                    n_gpu_layers, model_path)
+                        return {"ok": True, "model": model_path, "backend": "cpp", "model_loaded": True}
+                except Exception as e:
+                    logger.warning("gaia_cpp unavailable (%s) — falling back to llama-server", e)
+                    self._cpp_backend = None
+
+                # Fallback: llama-server subprocess
                 cmd = [
                     "llama-server",
                     "--model", model_path,
@@ -173,8 +202,19 @@ class EngineManager:
             return {"ok": False, "error": "worker failed to start within 180s"}
 
     def stop_worker(self) -> dict:
-        """Kill the worker subprocess — frees ALL GPU memory."""
+        """Kill the worker subprocess (or release cpp backend) — frees ALL GPU/RAM."""
         with self._lock:
+            # Handle gaia_cpp in-process backend
+            if self._cpp_backend is not None:
+                old_model = self.model_path
+                logger.info("Releasing gaia_cpp backend for %s", old_model)
+                try:
+                    del self._cpp_backend
+                except Exception:
+                    pass
+                self._cleanup_worker_state()
+                return {"ok": True, "message": "model unloaded (cpp)", "old_model": old_model}
+
             if self.worker_process is None:
                 return {"ok": True, "message": "already unloaded"}
 
@@ -212,6 +252,13 @@ class EngineManager:
         Inference requests (/v1/chat/completions) are serialized through a
         semaphore to prevent overwhelming the model with concurrent requests.
         """
+        # gaia_cpp in-process backend: handle directly without HTTP
+        with self._lock:
+            cpp = self._cpp_backend
+
+        if cpp is not None:
+            return self._proxy_cpp(method, path, body, cpp)
+
         with self._lock:
             port = self.worker_port
             if port is None:
@@ -265,9 +312,25 @@ class EngineManager:
 
     def health_response(self) -> dict:
         """Build health response based on worker state."""
+        # gaia_cpp in-process backend
+        with self._lock:
+            cpp = self._cpp_backend
+
+        if cpp is not None:
+            h = cpp.health()
+            h["managed"] = True
+            h["model_loaded"] = True
+            return h
+
         with self._lock:
             worker_alive = (self.worker_process is not None
                             and self.worker_process.poll() is None)
+            # Detect dead worker: process object exists but has exited
+            if self.worker_process is not None and not worker_alive:
+                exit_code = self.worker_process.returncode
+                logger.warning("Worker found dead (exit code %s) during health check — cleaning up", exit_code)
+                self._cleanup_worker_state()
+                worker_alive = False
             model_loaded = worker_alive and self.worker_port is not None
 
         if model_loaded:
@@ -277,6 +340,7 @@ class EngineManager:
                 try:
                     data = json.loads(body)
                     data["managed"] = True
+                    data["device"] = self.device or "unknown"
                     return data
                 except Exception:
                     pass
@@ -288,6 +352,7 @@ class EngineManager:
             "model_loaded": model_loaded,
             "mode": "active" if model_loaded else "standby",
             "managed": True,
+            "device": self.device or "none",
             "worker_pid": self.worker_process.pid if worker_alive else None,
         }
 
@@ -325,6 +390,32 @@ class EngineManager:
 
         return {"model_loaded": False, "model_path": "", "device": "none", "vram_mb": 0}
 
+    def _proxy_cpp(self, method: str, path: str, body: bytes, cpp) -> tuple:
+        """Handle a request via the gaia_cpp in-process backend (non-streaming)."""
+        ct = {"Content-Type": "application/json"}
+
+        if path == "/health":
+            h = cpp.health()
+            h["managed"] = True
+            return (200, ct, json.dumps(h).encode())
+
+        if path in ("/status", "/model/info"):
+            return (200, ct, json.dumps({"model_loaded": True, "backend": "cpp"}).encode())
+
+        if path == "/v1/chat/completions" and method == "POST" and body:
+            try:
+                req_data = json.loads(body)
+                messages = req_data.get("messages", [])
+                max_tokens = int(req_data.get("max_tokens", 512))
+                temperature = float(req_data.get("temperature", 0.7))
+                top_p = float(req_data.get("top_p", 0.9))
+                result = cpp.generate_json(messages, max_tokens, temperature, top_p)
+                return (200, ct, json.dumps(result).encode())
+            except Exception as e:
+                return (500, ct, json.dumps({"error": str(e)}).encode())
+
+        return (404, ct, json.dumps({"error": f"cpp backend: path not found: {path}"}).encode())
+
     def _kill_worker_process(self):
         """Kill the worker process. Must be called with lock held or from locked context."""
         if self.worker_process is None:
@@ -360,6 +451,7 @@ class EngineManager:
         self.model_path = None
         self.device = None
         self.backend = None
+        self._cpp_backend = None
 
     @staticmethod
     def _stream_output(pipe, label):
@@ -469,6 +561,14 @@ class ManagedEngineHandler(BaseHTTPRequestHandler):
         """Stream SSE response from worker to client, token by token."""
         import http.client
 
+        # gaia_cpp in-process streaming path
+        with self.manager._lock:
+            cpp = self.manager._cpp_backend
+
+        if cpp is not None:
+            self._proxy_stream_cpp(body, cpp)
+            return
+
         with self.manager._lock:
             port = self.manager.worker_port
         if port is None:
@@ -512,6 +612,44 @@ class ManagedEngineHandler(BaseHTTPRequestHandler):
         finally:
             self.manager._inference_semaphore.release()
 
+    def _proxy_stream_cpp(self, body: bytes, cpp):
+        """Stream SSE directly from gaia_cpp in-process backend."""
+        acquired = self.manager._inference_semaphore.acquire(timeout=120)
+        if not acquired:
+            self._json({"error": "inference queue full"}, 429)
+            return
+
+        try:
+            req_data = json.loads(body) if body else {}
+            messages = req_data.get("messages", [])
+            max_tokens = int(req_data.get("max_tokens", 512))
+            temperature = float(req_data.get("temperature", 0.7))
+            top_p = float(req_data.get("top_p", 0.9))
+            session_id = req_data.get("session_id", "")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+
+            for chunk_bytes in cpp.generate_stream_sse(
+                messages, max_tokens, temperature, top_p, session_id
+            ):
+                self.wfile.write(chunk_bytes)
+                self.wfile.flush()
+
+        except Exception as e:
+            logger.warning("cpp stream error: %s", e)
+            try:
+                self.wfile.write(
+                    f"data: {{\"error\": \"{e}\"}}\n\n".encode()
+                )
+                self.wfile.flush()
+            except Exception:
+                pass
+        finally:
+            self.manager._inference_semaphore.release()
+
     def _send_proxy_response(self, status: int, headers: dict, body: bytes):
         """Send a proxied response back to the client."""
         self.send_response(status)
@@ -522,6 +660,12 @@ class ManagedEngineHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+
+class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    """Threaded HTTP server so long-running requests (model load/unload)
+    don't block health probes and other concurrent requests."""
+    daemon_threads = True
 
 
 def serve_managed(port: int = 8092, host: str = "0.0.0.0"):
@@ -545,8 +689,8 @@ def serve_managed(port: int = 8092, host: str = "0.0.0.0"):
     # Create handler class with manager reference
     handler_class = type("Handler", (ManagedEngineHandler,), {"manager": manager})
 
-    server = HTTPServer((host, port), handler_class)
-    logger.info("GAIA Engine Manager (zero-GPU standby) on %s:%d", host, port)
+    server = _ThreadingHTTPServer((host, port), handler_class)
+    logger.info("GAIA Engine Manager (zero-GPU standby, threaded) on %s:%d", host, port)
 
     try:
         server.serve_forever()

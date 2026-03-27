@@ -144,18 +144,63 @@ public:
     }
 
     // ── LoRA adapter management ───────────────────────────────────────────────
+    //
+    // llama.cpp b8250 API:
+    //   llama_adapter_lora_init(model, path) → adapter*  (parse GGUF LoRA file)
+    //   llama_set_adapter_lora(ctx, adapter, scale)      (activate on context)
+    //   llama_rm_adapter_lora(ctx, adapter)              (deactivate from context)
+    //   llama_clear_adapter_lora(ctx)                    (remove all from context)
+    //   llama_adapter_lora_free(adapter)                 (free memory)
+    //
+    // Multiple adapters can be active simultaneously with different scales.
+    // The adapter modifies the model weights in-place during forward pass.
 
     bool load_lora(const std::string& path, float scale) {
-        // TODO Phase 4: implement using llama_set_adapters_lora (b8250+ API)
-        // The b8250 API changed from llama_set_adapter_lora (singular) to
-        // llama_set_adapters_lora (plural). Stubbed until Phase 4.
-        (void)path; (void)scale;
-        return false;
+        std::lock_guard<std::mutex> lock(inference_mtx_);
+
+        llama_adapter_lora* adapter = llama_adapter_lora_init(model_, path.c_str());
+        if (!adapter) {
+            return false;
+        }
+
+        lora_adapters_.push_back(adapter);
+        lora_scales_.push_back(scale);
+
+        // Apply all adapters at once (b8250 plural API)
+        int32_t ret = llama_set_adapters_lora(
+            ctx_,
+            lora_adapters_.data(),
+            lora_adapters_.size(),
+            lora_scales_.data()
+        );
+        if (ret != 0) {
+            // Roll back: remove the adapter we just added
+            lora_adapters_.pop_back();
+            lora_scales_.pop_back();
+            // Re-apply previous set
+            if (!lora_adapters_.empty()) {
+                llama_set_adapters_lora(ctx_, lora_adapters_.data(),
+                    lora_adapters_.size(), lora_scales_.data());
+            }
+            return false;
+        }
+
+        return true;
     }
 
     void clear_lora() {
-        // TODO Phase 4: implement using llama_set_adapters_lora with empty list
+        std::lock_guard<std::mutex> lock(inference_mtx_);
+
+        // Detach all adapters from context
+        llama_set_adapters_lora(ctx_, nullptr, 0, nullptr);
         lora_adapters_.clear();
+        lora_scales_.clear();
+        // Adapters freed automatically with model (b8250+)
+    }
+
+    // List active adapter count (for health/status reporting)
+    int active_adapter_count() const {
+        return static_cast<int>(lora_adapters_.size());
     }
 
     // ── Accessors ─────────────────────────────────────────────────────────────
@@ -184,6 +229,7 @@ private:
     HiddenStateCaptureState capture_state_;
     std::mutex inference_mtx_;
     std::vector<llama_adapter_lora*> lora_adapters_;
+    std::vector<float> lora_scales_;
 
     // ── Tokenize ──────────────────────────────────────────────────────────────
     std::vector<llama_token> _tokenize(const std::string& text, bool add_bos) {
@@ -431,6 +477,7 @@ PYBIND11_MODULE(gaia_cpp, m) {
         .def("load_lora",  &LlamaCppBackend::load_lora,
             py::arg("path"), py::arg("scale") = 1.0f)
         .def("clear_lora", &LlamaCppBackend::clear_lora)
+        .def("active_adapter_count", &LlamaCppBackend::active_adapter_count)
 
         .def("n_vocab",         &LlamaCppBackend::n_vocab)
         .def("n_embd",          &LlamaCppBackend::n_embd)

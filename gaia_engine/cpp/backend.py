@@ -179,6 +179,8 @@ class GaiaCppBackendAdapter:
             "n_vocab":   self._backend.n_vocab(),
             "has_gpu":   self._backend.has_gpu(),
             "tier":      self.tier,
+            "lora_active": self._backend.active_adapter_count(),
+            "lora_path":   self._lora_path,
         }
 
     # ── Streaming generation ──────────────────────────────────────────────────

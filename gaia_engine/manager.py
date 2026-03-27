@@ -40,7 +40,8 @@ from urllib.error import URLError
 logger = logging.getLogger("GAIA.EngineManager")
 
 # Requests that should NOT be proxied but handled by the manager directly
-_MANAGER_PATHS = {"/model/load", "/model/unload", "/model/swap", "/health", "/status", "/model/info"}
+_MANAGER_PATHS = {"/model/load", "/model/unload", "/model/swap", "/health", "/status", "/model/info",
+                  "/adapter/load", "/adapter/unload", "/adapter/list"}
 
 
 def _find_free_port() -> int:
@@ -414,6 +415,30 @@ class EngineManager:
                 return (200, ct, json.dumps(result).encode())
             except Exception as e:
                 return (500, ct, json.dumps({"error": str(e)}).encode())
+
+        # ── LoRA adapter management ──────────────────────────────────────
+        if path == "/adapter/load" and method == "POST" and body:
+            try:
+                req_data = json.loads(body)
+                adapter_path = req_data.get("adapter_path", "")
+                scale = float(req_data.get("scale", 1.0))
+                if not adapter_path:
+                    return (400, ct, json.dumps({"ok": False, "error": "adapter_path required"}).encode())
+                ok = cpp.load_adapter(adapter_path, scale)
+                return (200, ct, json.dumps({"ok": ok, "adapter_path": adapter_path, "scale": scale}).encode())
+            except Exception as e:
+                return (500, ct, json.dumps({"ok": False, "error": str(e)}).encode())
+
+        if path == "/adapter/unload" and method == "POST":
+            cpp.unload_adapter()
+            return (200, ct, json.dumps({"ok": True}).encode())
+
+        if path == "/adapter/list" and method == "GET":
+            h = cpp.health()
+            return (200, ct, json.dumps({
+                "active_count": h.get("lora_active", 0),
+                "active_path": h.get("lora_path"),
+            }).encode())
 
         return (404, ct, json.dumps({"error": f"cpp backend: path not found: {path}"}).encode())
 

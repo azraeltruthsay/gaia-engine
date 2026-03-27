@@ -102,12 +102,7 @@ public:
     }
 
     ~LlamaCppBackend() {
-        // Clear adapters before freeing context
-        for (auto* a : lora_adapters_) {
-            llama_adapter_lora_free(a);
-        }
-        lora_adapters_.clear();
-
+        lora_adapters_.clear();  // adapter memory managed by llama_model_free in b8250+
         if (ctx_)   { llama_free(ctx_); ctx_ = nullptr; }
         if (model_) { llama_model_free(model_); model_ = nullptr; }
         llama_backend_free();
@@ -149,21 +144,15 @@ public:
     // ── LoRA adapter management ───────────────────────────────────────────────
 
     bool load_lora(const std::string& path, float scale) {
-        llama_adapter_lora* adapter = llama_adapter_lora_init(model_, path.c_str());
-        if (!adapter) return false;
-        if (llama_set_adapter_lora(ctx_, adapter, scale) != 0) {
-            llama_adapter_lora_free(adapter);
-            return false;
-        }
-        lora_adapters_.push_back(adapter);
-        return true;
+        // TODO Phase 4: implement using llama_set_adapters_lora (b8250+ API)
+        // The b8250 API changed from llama_set_adapter_lora (singular) to
+        // llama_set_adapters_lora (plural). Stubbed until Phase 4.
+        (void)path; (void)scale;
+        return false;
     }
 
     void clear_lora() {
-        llama_clear_adapter_lora(ctx_);
-        for (auto* a : lora_adapters_) {
-            llama_adapter_lora_free(a);
-        }
+        // TODO Phase 4: implement using llama_set_adapters_lora with empty list
         lora_adapters_.clear();
     }
 
@@ -172,7 +161,7 @@ public:
     int n_vocab()       const { return llama_vocab_n_tokens(vocab_); }
     int n_embd()        const { return llama_model_n_embd(model_); }
     int n_layer()       const { return llama_model_n_layer(model_); }
-    bool has_gpu()      const { return llama_model_n_params(model_) > 0 && false; } // TODO: check CUDA
+    bool has_gpu()      const { return false; } // TODO Phase 5: check via llama_model GPU offload state
     std::string model_path() const { return model_path_; }
 
     std::vector<int> capture_layers() const {

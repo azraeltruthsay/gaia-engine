@@ -85,7 +85,7 @@ public:
         // ── Context params ─────────────────────────────────────────────────
         llama_context_params cparams = llama_context_default_params();
         cparams.n_ctx = static_cast<uint32_t>(n_ctx);
-        cparams.n_batch = 512;
+        cparams.n_batch = static_cast<uint32_t>(n_ctx);
         cparams.n_threads = (n_threads > 0)
             ? n_threads
             : static_cast<int>(std::thread::hardware_concurrency() / 2);

@@ -734,6 +734,101 @@ class GAIAEngine:
                 result[idx] = hidden_states[idx][:, -1:, :].detach()
         return result if result else None
 
+    # ── Vision-aware input preparation ───────────────────────────────────
+
+    def _has_vision_content(self, messages: list) -> bool:
+        """Check if any message contains image content (OpenAI multimodal format)."""
+        if not self.has_vision:
+            return False
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") in ("image", "image_url"):
+                        return True
+        return False
+
+    def _prepare_vision_inputs(self, messages: list) -> dict:
+        """Process multimodal messages through the VL processor.
+
+        Handles OpenAI-format vision messages where content is a list:
+            [{"type": "text", "text": "..."}, {"type": "image", "image": <PIL>}]
+        Also handles image_url with base64 data URIs or file paths.
+
+        Returns a dict of tensors ready for model.generate() or model().
+        """
+        import base64 as _b64
+        import io as _io
+        from PIL import Image
+
+        # Extract images and rebuild messages for the processor
+        images = []
+        processed_messages = []
+
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, str):
+                # Plain text message — pass through
+                processed_messages.append(msg)
+            elif isinstance(content, list):
+                # Multimodal message — extract images, rebuild content
+                new_content = []
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    ptype = part.get("type", "")
+                    if ptype == "image" and "image" in part:
+                        # Direct PIL image
+                        img = part["image"]
+                        if not isinstance(img, Image.Image):
+                            img = Image.open(img).convert("RGB")
+                        images.append(img)
+                        new_content.append({"type": "image", "image": img})
+                    elif ptype == "image_url":
+                        # Base64 data URI or file path
+                        url = part.get("image_url", {})
+                        if isinstance(url, dict):
+                            url = url.get("url", "")
+                        if url.startswith("data:image"):
+                            # data:image/jpeg;base64,/9j/4AAQ...
+                            header, b64data = url.split(",", 1)
+                            img = Image.open(_io.BytesIO(_b64.b64decode(b64data))).convert("RGB")
+                        elif url.startswith("/") or url.startswith("file://"):
+                            path = url.replace("file://", "")
+                            img = Image.open(path).convert("RGB")
+                        else:
+                            logger.warning("Unsupported image_url scheme: %s", url[:50])
+                            continue
+                        images.append(img)
+                        new_content.append({"type": "image", "image": img})
+                    elif ptype == "text":
+                        new_content.append({"type": "text", "text": part.get("text", "")})
+                    else:
+                        new_content.append(part)
+                processed_messages.append({"role": msg["role"], "content": new_content})
+            else:
+                processed_messages.append(msg)
+
+        if not images:
+            raise ValueError("_prepare_vision_inputs called but no images found in messages")
+
+        # Apply chat template through the processor
+        text_input = self.processor.apply_chat_template(
+            processed_messages, tokenize=False, add_generation_prompt=True,
+        )
+        inputs = self.processor(
+            text=[text_input],
+            images=images if images else None,
+            return_tensors="pt",
+            padding=True,
+        )
+
+        # Move all tensors to model device
+        device = self.model.device
+        inputs = {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
+
+        return inputs
+
     def generate(self, messages: list, max_tokens: int = 512,
                  temperature: float = 0.7, top_p: float = 0.9,
                  skip_prefix: bool = False) -> dict:
@@ -765,6 +860,54 @@ class GAIAEngine:
                 local_str = ""
                 local_simple = utc_str
                 date_str = ""
+
+            # ── VISION MODE: multimodal input via processor ────────────
+            if self._has_vision_content(messages):
+                logger.info("Vision content detected — using multimodal processor path")
+                vision_inputs = self._prepare_vision_inputs(messages)
+                input_ids = vision_inputs.pop("input_ids")
+                total_input = input_ids.shape[1]
+                past_kv = None
+                prefix_len = 0
+
+                # First forward — vision uses model.generate() for the prefill
+                # since it needs pixel_values/image_grid_thw handled by the model
+                capture = self.monitor.enabled
+                with torch.no_grad():
+                    output_ids = self.model.generate(
+                        input_ids=input_ids,
+                        **{k: v for k, v in vision_inputs.items()},
+                        max_new_tokens=max_tokens,
+                        temperature=temperature if temperature > 0 else None,
+                        do_sample=temperature > 0,
+                        top_p=top_p if temperature > 0 else None,
+                    )
+
+                # Decode only generated tokens
+                generated_ids = output_ids[0][input_ids.shape[1]:]
+                text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+                if "<think>" in text:
+                    text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+
+                self._request_count += 1
+                self._total_tokens += len(generated_ids)
+
+                return {
+                    "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": self.model_path,
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": text.strip()},
+                                 "finish_reason": "stop" if len(generated_ids) < max_tokens else "length"}],
+                    "usage": {
+                        "prompt_tokens": total_input,
+                        "completion_tokens": len(generated_ids),
+                        "total_tokens": total_input + len(generated_ids),
+                        "cached_prefix_tokens": 0,
+                        "mean_entropy": 0.0,
+                        "vision": True,
+                    },
+                }
 
             if skip_prefix:
                 # ── SLIM MODE: full few-shot prompt with live clock ──
@@ -991,6 +1134,39 @@ class GAIAEngine:
         # Reuse the same setup as generate() — build input_ids and KV cache
         # This is a simplified version that skips prefix cache for streaming
         with self._lock:
+            # ── VISION MODE: non-streaming fallback for multimodal ────
+            # Vision uses model.generate() which doesn't support our custom
+            # token-by-token loop (needs pixel_values in the initial forward).
+            # We generate the full response then yield it in chunks.
+            if self._has_vision_content(messages):
+                logger.info("Vision content in stream — using generate() fallback")
+                result = None
+                # Temporarily release lock to call generate()
+                # (generate() acquires its own lock)
+                self._lock.release()
+                try:
+                    result = self.generate(messages, max_tokens=max_tokens,
+                                           temperature=temperature, top_p=top_p)
+                finally:
+                    self._lock.acquire()
+
+                if result:
+                    text = result["choices"][0]["message"]["content"]
+                    gen_id = result["id"]
+                    # Yield in chunks to simulate streaming
+                    chunk_size = 4  # ~4 chars at a time
+                    for i in range(0, len(text), chunk_size):
+                        yield {
+                            "id": gen_id,
+                            "choices": [{"delta": {"content": text[i:i+chunk_size]}, "finish_reason": None}],
+                        }
+                    yield {
+                        "id": gen_id,
+                        "choices": [{"delta": {}, "finish_reason": "stop"}],
+                        "usage": result.get("usage", {}),
+                    }
+                return
+
             system = ""
             conversation = []
             for msg in messages:

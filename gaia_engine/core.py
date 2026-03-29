@@ -284,7 +284,7 @@ class PrefixCache:
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
-        self.segments = {"identity": "", "tools": "", "world_state": ""}
+        self.segments = {"identity": "", "tools": "", "world_state": "", "behavioral": ""}
         self._hashes: Dict[str, str] = {}
         self._cached_kv = None
         self._cached_len = 0
@@ -523,6 +523,29 @@ class GAIAEngine:
 
         # Initialize subsystems
         self.prefix_cache = PrefixCache(self.model, self.tokenizer, device)
+
+        # Load behavioral cache examples if available
+        _behavioral_path = os.path.join(
+            os.environ.get("KNOWLEDGE_DIR", "/knowledge"),
+            "system_reference", "behavioral_cache.json"
+        )
+        try:
+            if os.path.isfile(_behavioral_path):
+                import json as _json_bc
+                with open(_behavioral_path) as _f:
+                    _bc = _json_bc.load(_f)
+                _examples = _bc.get("examples", [])
+                if _examples:
+                    _lines = []
+                    for ex in _examples:
+                        _lines.append(f"[Example: {ex.get('context', '')}]")
+                        _lines.append(f"User: {ex['user']}")
+                        _lines.append(f"Assistant: {ex['assistant']}")
+                    self.prefix_cache.update_segment("behavioral", "\n".join(_lines))
+                    logger.info("Behavioral cache loaded: %d examples from %s", len(_examples), _behavioral_path)
+        except Exception as _bc_exc:
+            logger.debug("Behavioral cache not loaded: %s", _bc_exc)
+
         self.monitor = ActivationMonitor()
         self.thoughts = ThoughtManager()
         self._sae_atlas = None

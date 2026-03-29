@@ -15,7 +15,9 @@ Not a general-purpose inference server. Optimized for single-user, single-GPU de
 - **ROME Editing** — Rank-One Model Editing for surgical weight corrections.
 - **GPU Lifecycle** — Unified state machine (AWAKE/FOCUSING/SLEEP/DEEP_SLEEP/MEDITATION) with automatic tier management.
 - **GPTQ/NF4/int8** — Automatic quantization detection and loading.
-- **SSE Streaming** — True per-token streaming via manager proxy passthrough.
+- **SSE Streaming** — True per-token streaming via manager proxy passthrough (Transfer-Encoding: chunked removed for clean proxy compatibility).
+- **ThreadingHTTPServer** — Threaded manager so model load/unload don't block health probes.
+- **Dead Worker Detection** — Manager detects unexpected worker exits and resets state cleanly.
 
 ## Quick Start
 

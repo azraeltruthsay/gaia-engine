@@ -13,6 +13,7 @@ Falls back gracefully if the extension is missing (non-Prime tiers).
 
 import json
 import logging
+import re
 import os
 import threading
 import uuid
@@ -238,6 +239,9 @@ class GaiaCppBackendAdapter:
                 snapshot=snapshot,
             )
 
+        # Strip <think> blocks from final output
+        final_text = re.sub(r"<think>.*?</think>\s*", "", result.text.strip(), flags=re.DOTALL)
+
         # Final SSE chunk with full message + usage
         if write_fn is not None:
             final = {
@@ -246,7 +250,7 @@ class GaiaCppBackendAdapter:
                 "choices": [{
                     "delta":         {},
                     "finish_reason": "stop",
-                    "message":       {"role": "assistant", "content": result.text.strip()},
+                    "message":       {"role": "assistant", "content": final_text},
                 }],
                 "usage": {
                     "prompt_tokens":     result.prompt_tokens,
@@ -291,12 +295,16 @@ class GaiaCppBackendAdapter:
                 bool(self.capture_layers),
             )
 
+        # Strip <think> blocks from output (Qwen3 defaults to thinking mode)
+        text = result.text.strip()
+        text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+
         return {
             "id":      f"chatcmpl-{uuid.uuid4().hex[:8]}",
             "object":  "chat.completion",
             "choices": [{
                 "index":         0,
-                "message":       {"role": "assistant", "content": result.text.strip()},
+                "message":       {"role": "assistant", "content": text},
                 "finish_reason": "stop",
             }],
             "usage": {

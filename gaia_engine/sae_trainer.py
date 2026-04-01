@@ -146,6 +146,10 @@ class SAETrainer:
 
         One SAE per layer, each learning an overcomplete basis of features.
         """
+        # Re-enable gradients — core.py disables them globally for inference,
+        # but SAE training needs backprop through the autoencoder parameters.
+        torch.set_grad_enabled(True)
+
         if layers is None:
             layers = list(self.activations.keys())
 
@@ -165,17 +169,21 @@ class SAETrainer:
             logger.info("Training SAE for layer %d: %d samples × %d dims → %d features",
                         layer_idx, n_samples, hidden_size, num_features)
 
+            # Ensure activations are regular float32 for SAE training
+            # (BnB NF4 models may produce bfloat16 or non-standard dtypes)
+            all_acts = all_acts.float()
+
             # Normalize activations
             mean = all_acts.mean(dim=0)
             std = all_acts.std(dim=0).clamp(min=1e-6)
             all_acts_norm = (all_acts - mean) / std
 
-            # Create SAE (match activation dtype)
-            sae = SparseAutoencoder(hidden_size, num_features).to(dtype=all_acts_norm.dtype, device=self.device)
+            # Create SAE in float32
+            sae = SparseAutoencoder(hidden_size, num_features).to(dtype=torch.float32, device=self.device)
             optimizer = torch.optim.Adam(sae.parameters(), lr=lr)
 
-            # Move data to device
-            all_acts_device = all_acts_norm.to(self.device)
+            # Move data to device — ensure contiguous float32, detached from model graph
+            all_acts_device = all_acts_norm.detach().clone().to(self.device)
 
             # Train
             start = time.time()

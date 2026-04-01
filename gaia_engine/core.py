@@ -353,7 +353,9 @@ class GAIAEngine:
                  dtype=torch.bfloat16, compile_mode: str = "reduce-overhead"):
         self.model_path = model_path
         # Normalize device: orchestrator uses "gpu", PyTorch needs "cuda"
-        self.device = "cuda" if device == "gpu" else device
+        if device == "gpu":
+            device = "cuda"
+        self.device = device
         self.dtype = dtype
         self._lock = threading.Lock()
         self._request_count = 0

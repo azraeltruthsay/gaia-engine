@@ -9,7 +9,7 @@ import os
 
 # ── Inference ────────────────────────────────────────────────────────────────
 
-GGUF_CTX_SIZE: int = int(os.environ.get("GGUF_CTX_SIZE", "4096"))
+GGUF_CTX_SIZE: int = int(os.environ.get("GGUF_CTX_SIZE", os.environ.get("CORE_CPU_CTX", "16384")))
 GGUF_THREADS: int = int(os.environ.get("GGUF_THREADS", "16"))
 
 # ── Identity ─────────────────────────────────────────────────────────────────

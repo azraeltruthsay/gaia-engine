@@ -116,7 +116,7 @@ class StaticKVCache:
 
     def __init__(self, model, max_seq_len: int = 4096, device: str = "cuda"):
         self.max_seq_len = max_seq_len
-        self.device = device
+        self.device = "cuda" if device == "gpu" else device
         self.position = 0
 
         # Extract model config
@@ -283,7 +283,7 @@ class PrefixCache:
     def __init__(self, model, tokenizer, device: str = "cuda"):
         self.model = model
         self.tokenizer = tokenizer
-        self.device = device
+        self.device = "cuda" if device == "gpu" else device
         self.segments = {"identity": "", "tools": "", "world_state": "", "behavioral": ""}
         self._hashes: Dict[str, str] = {}
         self._cached_kv = None
@@ -352,7 +352,8 @@ class GAIAEngine:
     def __init__(self, model_path: str, device: str = "cuda",
                  dtype=torch.bfloat16, compile_mode: str = "reduce-overhead"):
         self.model_path = model_path
-        self.device = device
+        # Normalize device: orchestrator uses "gpu", PyTorch needs "cuda"
+        self.device = "cuda" if device == "gpu" else device
         self.dtype = dtype
         self._lock = threading.Lock()
         self._request_count = 0
@@ -1310,6 +1311,7 @@ class GAIAEngine:
 
     def migrate_to(self, target: str) -> dict:
         """Migrate model between GPU and CPU."""
+        target = "cuda" if target == "gpu" else target
         with self._lock:
             if self.device == target:
                 return {"ok": True, "device": self.device, "message": "already there"}

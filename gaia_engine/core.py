@@ -465,10 +465,12 @@ class GAIAEngine:
                     low_cpu_mem_usage=True,
                     attn_implementation="sdpa",
                 )
-                # Move quantized model to GPU via accelerate
-                from accelerate import dispatch_model, infer_auto_device_map
-                device_map = infer_auto_device_map(self.model, max_memory={0: f"{int(gpu_free_mb * 0.8)}MB", "cpu": "32GB"})
-                self.model = dispatch_model(self.model, device_map)
+                # Move quantized model to GPU — NF4 is ~0.5 bytes/param,
+                # so an 8B model is ~4.5GB, well within GPU budget.
+                # Simple .to("cuda") is more reliable than dispatch_model
+                # which can split layers across CPU/GPU and cause device mismatches.
+                self.model = self.model.to("cuda")
+                torch.cuda.empty_cache()
                 quant_mb = torch.cuda.memory_allocated() / (1024**2)
                 logger.info("NF4 model loaded: %.0fMB on GPU (CPU-first)", quant_mb)
             except Exception as e:

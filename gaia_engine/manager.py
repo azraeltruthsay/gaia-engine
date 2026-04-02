@@ -411,7 +411,13 @@ class EngineManager:
                 max_tokens = int(req_data.get("max_tokens", 512))
                 temperature = float(req_data.get("temperature", 0.7))
                 top_p = float(req_data.get("top_p", 0.9))
-                result = cpp.generate_json(messages, max_tokens, temperature, top_p)
+                # Extract enable_thinking from chat_template_kwargs
+                template_kwargs = req_data.get("chat_template_kwargs", {})
+                enable_thinking = template_kwargs.get("enable_thinking", True)
+                result = cpp.generate_json(
+                    messages, max_tokens, temperature, top_p,
+                    enable_thinking=enable_thinking,
+                )
                 return (200, ct, json.dumps(result).encode())
             except Exception as e:
                 return (500, ct, json.dumps({"error": str(e)}).encode())

@@ -285,9 +285,10 @@ class GaiaCppBackendAdapter:
         max_tokens: int = 512,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        enable_thinking: bool = True,
     ) -> dict:
         """Non-streaming generation, returns OpenAI-compatible JSON dict."""
-        prompt = self._build_prompt(messages)
+        prompt = self._build_prompt(messages, enable_thinking=enable_thinking)
 
         with self._request_lock:
             result = self._backend.generate(
@@ -296,8 +297,11 @@ class GaiaCppBackendAdapter:
             )
 
         # Strip <think> blocks from output (Qwen3 defaults to thinking mode)
+        # Handles both closed <think>...</think> and unclosed <think>... (hit max_tokens)
         text = result.text.strip()
         text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+        text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL)
+        text = text.strip()
 
         return {
             "id":      f"chatcmpl-{uuid.uuid4().hex[:8]}",
@@ -333,15 +337,21 @@ class GaiaCppBackendAdapter:
 
     # ── Prompt formatting ─────────────────────────────────────────────────────
 
-    def _build_prompt(self, messages: list) -> str:
+    def _build_prompt(self, messages: list, enable_thinking: bool = True) -> str:
         """
         Build ChatML-formatted prompt for Qwen3/Qwen2 models.
         Matches the template llama-server uses for these model families.
+
+        When enable_thinking=False, injects an empty <think> block after the
+        assistant start token to suppress Qwen3's chain-of-thought mode.
         """
         parts = []
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
             parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
-        parts.append("<|im_start|>assistant\n")
+        if enable_thinking:
+            parts.append("<|im_start|>assistant\n")
+        else:
+            parts.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
         return "\n".join(parts)

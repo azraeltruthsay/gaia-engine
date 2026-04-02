@@ -276,38 +276,60 @@ class EngineManager:
                         json.dumps({"error": "inference queue full — try again shortly"}).encode())
 
         url = f"http://127.0.0.1:{port}{path}"
-        try:
-            req = Request(url, data=body if body else None, method=method)
-            for k, v in headers.items():
-                # Skip hop-by-hop headers
-                if k.lower() not in ("host", "connection", "transfer-encoding"):
-                    req.add_header(k, v)
 
-            with urlopen(req, timeout=300) as resp:
-                resp_body = resp.read()
-                resp_headers = {k: v for k, v in resp.getheaders()}
-                return (resp.status, resp_headers, resp_body)
-        except URLError as e:
-            # Worker might have crashed
-            if self.worker_process and self.worker_process.poll() is not None:
-                exit_code = self.worker_process.returncode
-                logger.error("Worker process died (exit code %d) — this causes 'silent unload'", exit_code)
-                try:
-                    if self.event_callback:
-                        self.event_callback("engine", f"Worker CRASHED (exit code {exit_code})",
-                                            source="engine_manager",
-                                            details={"model": self.model_path, "exit_code": exit_code})
-                except Exception:
-                    pass
-                with self._lock:
-                    self._cleanup_worker_state()
-                return (503, {"Content-Type": "application/json"},
-                        json.dumps({"error": "worker process crashed"}).encode())
-            return (502, {"Content-Type": "application/json"},
-                    json.dumps({"error": f"worker proxy error: {e}"}).encode())
-        except Exception as e:
-            return (502, {"Content-Type": "application/json"},
-                    json.dumps({"error": f"proxy error: {e}"}).encode())
+        # Retry loop: on proxy failure, verify worker health and retry once
+        max_attempts = 2
+        last_error = None
+        for attempt in range(max_attempts):
+            try:
+                req = Request(url, data=body if body else None, method=method)
+                for k, v in headers.items():
+                    if k.lower() not in ("host", "connection", "transfer-encoding"):
+                        req.add_header(k, v)
+
+                with urlopen(req, timeout=300) as resp:
+                    resp_body = resp.read()
+                    resp_headers = {k: v for k, v in resp.getheaders()}
+                    return (resp.status, resp_headers, resp_body)
+            except URLError as e:
+                last_error = e
+                # Worker might have crashed
+                if self.worker_process and self.worker_process.poll() is not None:
+                    exit_code = self.worker_process.returncode
+                    logger.error("Worker process died (exit code %d) — this causes 'silent unload'", exit_code)
+                    try:
+                        if self.event_callback:
+                            self.event_callback("engine", f"Worker CRASHED (exit code {exit_code})",
+                                                source="engine_manager",
+                                                details={"model": self.model_path, "exit_code": exit_code})
+                    except Exception:
+                        pass
+                    with self._lock:
+                        self._cleanup_worker_state()
+                    return (503, {"Content-Type": "application/json"},
+                            json.dumps({"error": "worker process crashed"}).encode())
+
+                # Worker alive but proxy failed — check health before retry
+                if attempt < max_attempts - 1:
+                    logger.warning("Proxy failed (attempt %d/%d): %s — checking worker health",
+                                   attempt + 1, max_attempts, e)
+                    if _wait_for_health(port, timeout=10):
+                        logger.info("Worker healthy on port %d — retrying request", port)
+                        import time as _time
+                        _time.sleep(0.5)
+                        continue
+                    else:
+                        logger.warning("Worker not healthy — attempting recovery")
+                        # Try to detect if worker moved to a different port
+                        # (shouldn't happen, but defensive)
+                        break
+
+            except Exception as e:
+                last_error = e
+                break
+
+        return (502, {"Content-Type": "application/json"},
+                json.dumps({"error": f"worker proxy error: {last_error}"}).encode())
         finally:
             if is_inference:
                 self._inference_semaphore.release()
@@ -346,6 +368,14 @@ class EngineManager:
                     return data
                 except Exception:
                     pass
+            elif status in (502, 503) and worker_alive:
+                # Worker process alive but proxy broken — stale connection
+                logger.warning(
+                    "Worker alive (PID %s) but proxy returned %d — connection may be stale. "
+                    "Port %s may not be reachable.",
+                    self.worker_process.pid if self.worker_process else "?",
+                    status, self.worker_port,
+                )
 
         return {
             "status": "ok",

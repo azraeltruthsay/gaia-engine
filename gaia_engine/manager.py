@@ -546,12 +546,19 @@ class ManagedEngineHandler(BaseHTTPRequestHandler):
             logger.debug(fmt, *args)
 
     def _json(self, data, status=200):
-        body = json.dumps(data).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            body = json.dumps(data).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except BrokenPipeError:
+            # Client disconnected before response was sent.
+            # This is normal (timeout, cancelled request) — NOT a backend error.
+            # Do NOT propagate — it would kill the handler thread and
+            # BaseHTTPServer would log it as "Exception during processing".
+            logger.debug("Client disconnected before response (BrokenPipe) — ignoring")
 
     def _read_body(self) -> bytes:
         n = int(self.headers.get("Content-Length", 0))

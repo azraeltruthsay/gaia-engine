@@ -41,7 +41,7 @@ logger = logging.getLogger("GAIA.EngineManager")
 
 # Requests that should NOT be proxied but handled by the manager directly
 _MANAGER_PATHS = {"/model/load", "/model/unload", "/model/swap", "/health", "/status", "/model/info",
-                  "/adapter/load", "/adapter/unload", "/adapter/list"}
+                  "/adapter/load", "/adapter/unload", "/adapter/list", "/adapter/set"}
 
 
 def _find_free_port() -> int:
@@ -417,15 +417,42 @@ class EngineManager:
                 return (500, ct, json.dumps({"error": str(e)}).encode())
 
         # ── LoRA adapter management ──────────────────────────────────────
+        # Accepts both formats:
+        #   cpp native: {"adapter_path": "/path/to/adapter.gguf", "scale": 1.0}
+        #   unified:    {"name": "adapter_name", "path": "/path/to/adapter/dir"}
+        #               (auto-finds adapter.gguf in the directory)
         if path == "/adapter/load" and method == "POST" and body:
             try:
+                import os as _os
                 req_data = json.loads(body)
                 adapter_path = req_data.get("adapter_path", "")
                 scale = float(req_data.get("scale", 1.0))
+
+                # Unified format: resolve directory → adapter.gguf
                 if not adapter_path:
-                    return (400, ct, json.dumps({"ok": False, "error": "adapter_path required"}).encode())
+                    dir_path = req_data.get("path", "")
+                    if dir_path and _os.path.isdir(dir_path):
+                        gguf_path = _os.path.join(dir_path, "adapter.gguf")
+                        if _os.path.isfile(gguf_path):
+                            adapter_path = gguf_path
+                            logger.info("Resolved adapter dir → %s", adapter_path)
+                        else:
+                            return (400, ct, json.dumps({
+                                "ok": False,
+                                "error": f"No adapter.gguf found in {dir_path}. "
+                                         f"Convert safetensors adapter to GGUF first."
+                            }).encode())
+
+                if not adapter_path:
+                    return (400, ct, json.dumps({"ok": False, "error": "adapter_path or path required"}).encode())
+
+                name = req_data.get("name", _os.path.basename(_os.path.dirname(adapter_path)))
                 ok = cpp.load_adapter(adapter_path, scale)
-                return (200, ct, json.dumps({"ok": ok, "adapter_path": adapter_path, "scale": scale}).encode())
+                return (200, ct, json.dumps({
+                    "ok": ok, "adapter": name, "adapter_path": adapter_path,
+                    "scale": scale, "vram_mb": 0,
+                    "loaded_adapters": [name] if ok else [],
+                }).encode())
             except Exception as e:
                 return (500, ct, json.dumps({"ok": False, "error": str(e)}).encode())
 
@@ -433,7 +460,17 @@ class EngineManager:
             cpp.unload_adapter()
             return (200, ct, json.dumps({"ok": True}).encode())
 
-        if path == "/adapter/list" and method == "GET":
+        if path == "/adapter/set" and method == "POST" and body:
+            # For cpp backend, set = load (only one active at a time)
+            req_data = json.loads(body)
+            name = req_data.get("name", "")
+            h = cpp.health()
+            return (200, ct, json.dumps({
+                "ok": True, "active": name,
+                "loaded": [name] if h.get("lora_active", 0) > 0 else [],
+            }).encode())
+
+        if path == "/adapter/list" and (method == "GET" or method == "POST"):
             h = cpp.health()
             return (200, ct, json.dumps({
                 "active_count": h.get("lora_active", 0),

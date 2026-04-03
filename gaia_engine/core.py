@@ -422,8 +422,11 @@ class GAIAEngine:
 
         # Estimate model size BEFORE loading to decide quantization strategy
         # Check config.json for num_params or estimate from file sizes
-        use_nf4 = False
-        if device == "cuda" and torch.cuda.is_available() and not is_prequantized:
+        # GAIA_ENGINE_QUANTIZE=nf4 forces NF4 regardless of size estimation
+        use_nf4 = os.environ.get("GAIA_ENGINE_QUANTIZE", "").lower() == "nf4"
+        if use_nf4:
+            logger.info("NF4 quantization forced via GAIA_ENGINE_QUANTIZE=nf4")
+        if not use_nf4 and device == "cuda" and torch.cuda.is_available() and not is_prequantized:
             try:
                 import json as _json
                 config_path = Path(model_path) / "config.json"

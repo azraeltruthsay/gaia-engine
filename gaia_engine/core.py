@@ -1474,11 +1474,19 @@ class EngineHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             loaded = _engine is not None and _engine.model is not None
+            vram = 0
+            if loaded and _engine.device == "cuda":
+                try:
+                    vram = torch.cuda.memory_allocated() // (1024 ** 2)
+                except Exception:
+                    pass
             self._json({
                 "status": "ok",
                 "engine": "gaia",
                 "model_loaded": loaded,
                 "mode": "active" if loaded else "standby",
+                "device": _engine.device if _engine else "none",
+                "vram_mb": vram,
             })
         elif self.path == "/v1/models":
             self._json({"object": "list", "data": [{"id": _engine.model_path, "object": "model", "owned_by": "gaia"}]})

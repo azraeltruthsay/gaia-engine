@@ -422,7 +422,14 @@ class EngineManager:
             return (200, ct, json.dumps(h).encode())
 
         if path in ("/status", "/model/info"):
-            return (200, ct, json.dumps({"model_loaded": True, "backend": "cpp"}).encode())
+            h = cpp.health()
+            return (200, ct, json.dumps({
+                "model_loaded": True,
+                "backend": "cpp",
+                "device": "cuda" if h.get("has_gpu") else "cpu",
+                "vram_mb": 0,  # cpp backend doesn't track VRAM per-model
+                "model": h.get("model", ""),
+            }).encode())
 
         if path == "/v1/chat/completions" and method == "POST" and body:
             try:

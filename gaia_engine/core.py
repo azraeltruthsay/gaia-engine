@@ -1067,12 +1067,14 @@ class GAIAEngine:
             generated = []
             current_kv = past_kv
 
-            # First forward — process input + capture activations
+            # First forward — process input (skip hidden states capture on prompt
+            # forward — storing all-layer activations for 300+ tokens at once
+            # requires ~1.7GB extra VRAM which OOMs on 16GB GPU)
             capture = self.monitor.enabled
             if capture:
                 from gaia_engine.config import ENGINE_TIER
             out = self.model(input_ids, past_key_values=current_kv,
-                              use_cache=True, output_hidden_states=capture)
+                              use_cache=True, output_hidden_states=False)
             current_kv = out.past_key_values
             logits = out.logits[:, -1, :]
 
@@ -1257,8 +1259,10 @@ class GAIAEngine:
             from gaia_engine.config import ENGINE_TIER
             _tier = ENGINE_TIER
 
+            # Skip hidden states on prompt forward — all-layer activations for
+            # long prompts OOM on 16GB GPU. Capture during autoregressive loop only.
             out = self.model(input_ids, use_cache=True,
-                             output_hidden_states=_capture)
+                             output_hidden_states=False)
             current_kv = out.past_key_values
             logits = out.logits[:, -1, :]
 

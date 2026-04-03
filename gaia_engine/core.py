@@ -1069,6 +1069,8 @@ class GAIAEngine:
 
             # First forward — process input + capture activations
             capture = self.monitor.enabled
+            if capture:
+                from gaia_engine.config import ENGINE_TIER
             out = self.model(input_ids, past_key_values=current_kv,
                               use_cache=True, output_hidden_states=capture)
             current_kv = out.past_key_values
@@ -1076,7 +1078,10 @@ class GAIAEngine:
 
             if capture and hasattr(out, "hidden_states") and out.hidden_states:
                 filtered = self._extract_target_hidden_states(out.hidden_states)
-                self.monitor.capture(filtered)
+                snapshot = self.monitor.capture(filtered)
+                if snapshot:
+                    _write_activation(ENGINE_TIER, "<prompt>", 0, "",
+                                      snapshot, self._sae_atlas, self._sae_labels)
             del out  # Free full output immediately
 
             # Autoregressive loop — minimal overhead, with entropy tracking
@@ -1126,10 +1131,22 @@ class GAIAEngine:
                     break
                 generated.append(token)
 
-                # Forward single token (no hidden states capture for speed)
-                out = self.model(next_id, past_key_values=current_kv, use_cache=True)
+                # Forward single token — capture hidden states every Nth token
+                _need_hidden = capture and (step % _SAE_STREAM_EVERY_N == 0)
+                out = self.model(next_id, past_key_values=current_kv,
+                                 use_cache=True, output_hidden_states=_need_hidden)
                 current_kv = out.past_key_values
                 logits = out.logits[:, -1, :]
+
+                if _need_hidden and hasattr(out, "hidden_states") and out.hidden_states:
+                    filtered = self._extract_target_hidden_states(out.hidden_states)
+                    snapshot = self.monitor.capture(filtered)
+                    if snapshot:
+                        _write_activation(
+                            ENGINE_TIER,
+                            self.tokenizer.decode([token]),
+                            step + 1, "",
+                            snapshot, self._sae_atlas, self._sae_labels)
                 del out
 
             # Decode

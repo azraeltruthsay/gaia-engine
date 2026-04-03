@@ -41,7 +41,9 @@ logger = logging.getLogger("GAIA.EngineManager")
 
 # Requests that should NOT be proxied but handled by the manager directly
 _MANAGER_PATHS = {"/model/load", "/model/unload", "/model/swap", "/health", "/status", "/model/info",
-                  "/adapter/load", "/adapter/unload", "/adapter/list", "/adapter/set"}
+                  "/adapter/load", "/adapter/unload", "/adapter/list", "/adapter/set",
+                  "/inference/drain", "/inference/resume", "/inference/cancel",
+                  "/model/migrate"}
 
 
 def _find_free_port() -> int:
@@ -84,6 +86,11 @@ class EngineManager:
         # Additional requests block until a slot opens. Prevents overwhelming
         # the model with rapid-fire Discord messages.
         self._inference_semaphore = threading.Semaphore(max_concurrent)
+        # Drain state: graceful inference shutdown for model transitions
+        self._draining = False
+        self._drain_event = threading.Event()
+        self._drain_event.set()  # Not draining initially
+        self._active_inference_count = 0
         self._worker_stdout_thread = None
         self._worker_stderr_thread = None
         # gaia_cpp in-process backend (set when backend='cpp')
@@ -236,6 +243,112 @@ class EngineManager:
                 pass
             return {"ok": True, "message": "model unloaded", "old_model": old_model}
 
+    def drain(self, timeout_s: float = 30.0) -> dict:
+        """Stop accepting new inference, wait for in-flight requests to complete.
+
+        The orchestrator calls this before model unload/swap to ensure no
+        request is cut mid-generation. Returns when all active inference
+        completes or timeout expires.
+        """
+        with self._lock:
+            if self._draining:
+                return {"ok": True, "message": "already draining",
+                        "active": self._active_inference_count}
+            self._draining = True
+            self._drain_event.clear()
+            active = self._active_inference_count
+
+        if active == 0:
+            self._drain_event.set()
+            return {"ok": True, "message": "drained (no active requests)", "active": 0}
+
+        logger.info("Draining: waiting for %d active inference request(s)...", active)
+        drained = self._drain_event.wait(timeout=timeout_s)
+        with self._lock:
+            remaining = self._active_inference_count
+        if drained:
+            logger.info("Drain complete — all requests finished")
+        else:
+            logger.warning("Drain timeout after %.0fs — %d request(s) still active",
+                           timeout_s, remaining)
+        return {"ok": drained,
+                "message": "drained" if drained else f"timeout ({remaining} active)",
+                "active": remaining}
+
+    def resume(self) -> dict:
+        """Resume accepting inference requests after drain."""
+        with self._lock:
+            was_draining = self._draining
+            self._draining = False
+            self._drain_event.set()
+        if was_draining:
+            logger.info("Inference resumed")
+        return {"ok": True, "was_draining": was_draining}
+
+    def migrate_device(self, target_device: str) -> dict:
+        """Migrate model between GPU and CPU without killing the worker.
+
+        This is the fast path for FOCUSING transitions: instead of
+        unloading and reloading (~95s), migrate the NF4 weights
+        between CPU RAM and GPU VRAM (~5s).
+
+        Only works with the Python GAIA Engine backend (safetensors).
+        GGUF/cpp backends don't support migration.
+        """
+        if self.backend not in ("engine", None):
+            return {"ok": False, "error": f"migration not supported for backend '{self.backend}'"}
+
+        with self._lock:
+            if self.worker_process is None or self.worker_port is None:
+                return {"ok": False, "error": "no active worker"}
+            port = self.worker_port
+
+        # Normalize: worker expects /device/gpu or /device/cpu
+        target = "gpu" if target_device in ("gpu", "cuda") else "cpu"
+
+        try:
+            endpoint = f"http://127.0.0.1:{port}/device/{target}"
+            req = Request(endpoint, method="POST", data=b"",
+                          headers={"Content-Type": "application/json"})
+            with urlopen(req, timeout=60) as resp:
+                result = json.loads(resp.read())
+
+            if result.get("ok"):
+                self.device = "cuda" if target == "gpu" else "cpu"
+                logger.info("Model migrated to %s in %.1fs (vram=%sMB)",
+                            target, result.get("elapsed_s", 0), result.get("vram_mb", 0))
+            return result
+        except Exception as e:
+            logger.warning("Migration to %s failed: %s", target, e)
+            return {"ok": False, "error": str(e)}
+
+    def cancel_inference(self, respawn: bool = True) -> dict:
+        """Cancel active generation by killing and optionally respawning the worker.
+
+        Enables "stop generating" and "answer now" from UI.
+        With respawn=True (default), the model is reloaded after kill.
+        With respawn=False, the model is fully unloaded.
+        """
+        with self._lock:
+            if self.worker_process is None and self._cpp_backend is None:
+                return {"ok": False, "error": "no active worker"}
+            model = self.model_path
+            device = self.device
+
+        logger.info("Cancelling inference (respawn=%s)", respawn)
+        # Drain state cleanup — we're force-killing anyway
+        self._draining = False
+        self._drain_event.set()
+        self._active_inference_count = 0
+
+        self.stop_worker()
+
+        if respawn and model:
+            result = self.start_worker(model, device or "cuda")
+            result["cancelled"] = True
+            return result
+        return {"ok": True, "cancelled": True, "respawned": False}
+
     def swap_worker(self, model_path: str, device: str = "cuda",
                     compile_mode: str = "reduce-overhead",
                     quantize: str = "") -> dict:
@@ -270,10 +383,16 @@ class EngineManager:
         # Queue inference requests — only one at a time
         is_inference = "/v1/chat/completions" in path
         if is_inference:
+            # Reject new inference while draining (clutch engaged)
+            if self._draining:
+                return (503, {"Content-Type": "application/json"},
+                        json.dumps({"error": "engine draining", "retry_after_ms": 500}).encode())
             acquired = self._inference_semaphore.acquire(timeout=120)
             if not acquired:
                 return (429, {"Content-Type": "application/json"},
                         json.dumps({"error": "inference queue full — try again shortly"}).encode())
+            with self._lock:
+                self._active_inference_count += 1
 
         url = f"http://127.0.0.1:{port}{path}"
 
@@ -323,6 +442,10 @@ class EngineManager:
         finally:
             if is_inference:
                 self._inference_semaphore.release()
+                with self._lock:
+                    self._active_inference_count -= 1
+                    if self._draining and self._active_inference_count == 0:
+                        self._drain_event.set()
 
     def health_response(self) -> dict:
         """Build health response based on worker state."""
@@ -334,6 +457,8 @@ class EngineManager:
             h = cpp.health()
             h["managed"] = True
             h["model_loaded"] = True
+            h["draining"] = self._draining
+            h["active_inference"] = self._active_inference_count
             return h
 
         with self._lock:
@@ -355,6 +480,8 @@ class EngineManager:
                     data = json.loads(body)
                     data["managed"] = True
                     data["device"] = self.device or "unknown"
+                    data["draining"] = self._draining
+                    data["active_inference"] = self._active_inference_count
                     return data
                 except Exception:
                     pass
@@ -376,6 +503,8 @@ class EngineManager:
             "managed": True,
             "device": self.device or "none",
             "worker_pid": self.worker_process.pid if worker_alive else None,
+            "draining": self._draining,
+            "active_inference": self._active_inference_count,
         }
 
     def status_response(self) -> dict:
@@ -419,6 +548,12 @@ class EngineManager:
         if path == "/health":
             h = cpp.health()
             h["managed"] = True
+            h["model_loaded"] = True
+            h["mode"] = "active"
+            h["backend"] = "cpp"
+            h["device"] = "cuda" if h.get("has_gpu") else "cpu"
+            h["draining"] = self._draining
+            h["active_inference"] = self._active_inference_count
             return (200, ct, json.dumps(h).encode())
 
         if path in ("/status", "/model/info"):
@@ -643,6 +778,30 @@ class ManagedEngineHandler(BaseHTTPRequestHandler):
             status = 200 if result.get("ok") else 500
             self._json(result, status)
 
+        elif self.path == "/inference/drain":
+            b = json.loads(raw_body) if raw_body else {}
+            timeout_s = float(b.get("timeout_s", 30))
+            self._json(self.manager.drain(timeout_s))
+
+        elif self.path == "/inference/resume":
+            self._json(self.manager.resume())
+
+        elif self.path == "/inference/cancel":
+            # Cancel active generation — kill worker and respawn
+            # Enables "stop generating" and "answer now" from UI
+            b = json.loads(raw_body) if raw_body else {}
+            respawn = b.get("respawn", True)
+            result = self.manager.cancel_inference(respawn=respawn)
+            self._json(result)
+
+        elif self.path == "/model/migrate":
+            # Migrate model between GPU and CPU without killing the worker
+            # Fast path: ~5s instead of ~95s for FOCUSING transitions
+            b = json.loads(raw_body) if raw_body else {}
+            device = b.get("device", "cpu")
+            result = self.manager.migrate_device(device)
+            self._json(result)
+
         else:
             # Check if this is a streaming inference request
             is_stream = False
@@ -678,11 +837,18 @@ class ManagedEngineHandler(BaseHTTPRequestHandler):
             self._json({"error": "no model loaded"}, 503)
             return
 
+        # Reject new inference while draining (clutch engaged)
+        if self.manager._draining:
+            self._json({"error": "engine draining", "retry_after_ms": 500}, 503)
+            return
+
         # Acquire inference semaphore
         acquired = self.manager._inference_semaphore.acquire(timeout=120)
         if not acquired:
             self._json({"error": "inference queue full"}, 429)
             return
+        with self.manager._lock:
+            self.manager._active_inference_count += 1
 
         try:
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=300)
@@ -714,6 +880,10 @@ class ManagedEngineHandler(BaseHTTPRequestHandler):
                 pass
         finally:
             self.manager._inference_semaphore.release()
+            with self.manager._lock:
+                self.manager._active_inference_count -= 1
+                if self.manager._draining and self.manager._active_inference_count == 0:
+                    self.manager._drain_event.set()
 
     def _proxy_stream_cpp(self, body: bytes, cpp):
         """Stream SSE directly from gaia_cpp in-process backend.
@@ -722,10 +892,17 @@ class ManagedEngineHandler(BaseHTTPRequestHandler):
         Runs on the HTTP handler thread (which has valid GIL state) so pybind11's
         py::gil_scoped_release works without crashing on Python 3.11.
         """
+        # Reject new inference while draining (clutch engaged)
+        if self.manager._draining:
+            self._json({"error": "engine draining", "retry_after_ms": 500}, 503)
+            return
+
         acquired = self.manager._inference_semaphore.acquire(timeout=120)
         if not acquired:
             self._json({"error": "inference queue full"}, 429)
             return
+        with self.manager._lock:
+            self.manager._active_inference_count += 1
 
         try:
             req_data = json.loads(body) if body else {}
@@ -760,6 +937,10 @@ class ManagedEngineHandler(BaseHTTPRequestHandler):
                 pass
         finally:
             self.manager._inference_semaphore.release()
+            with self.manager._lock:
+                self.manager._active_inference_count -= 1
+                if self.manager._draining and self.manager._active_inference_count == 0:
+                    self.manager._drain_event.set()
 
     def _send_proxy_response(self, status: int, headers: dict, body: bytes):
         """Send a proxied response back to the client."""

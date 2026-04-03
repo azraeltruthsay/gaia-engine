@@ -15,7 +15,12 @@ Each container imports this library and serves one model through it.
 
 from gaia_engine.core import GAIAEngine, serve
 from gaia_engine.manager import EngineManager, serve_managed
-from gaia_engine.thought_composer import compose_thoughts, estimate_composed_size
+
+try:
+    from gaia_engine.thought_composer import compose_thoughts, estimate_composed_size
+except ImportError:
+    compose_thoughts = None
+    estimate_composed_size = None
 
 __version__ = "1.0.0"
 

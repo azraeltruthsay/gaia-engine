@@ -859,13 +859,16 @@ class GAIAEngine:
 
     def generate(self, messages: list, max_tokens: int = 512,
                  temperature: float = 0.7, top_p: float = 0.9,
-                 skip_prefix: bool = False) -> dict:
+                 skip_prefix: bool = False,
+                 enable_thinking: bool = True) -> dict:
         """Generate a chat completion with full introspection.
 
         Args:
             skip_prefix: If True, use slim mode — cache the few-shot
                 structure as KV prefix, inject only clock + user query
                 as dynamic tokens. ~20 tokens/request instead of ~240.
+            enable_thinking: If False, inject empty <think> block to
+                suppress Qwen3 chain-of-thought mode.
         """
         with self._lock:
             import time as _time
@@ -978,7 +981,10 @@ class GAIAEngine:
 
                 # Dynamic part: only the user's actual question (~10 tokens)
                 actual_question = conversation[-1].get("content", "") if conversation else ""
-                conv_text = f"<|im_start|>user\n{actual_question}<|im_end|>\n<|im_start|>assistant\n"
+                _asst_prefix = "<|im_start|>assistant\n"
+                if not enable_thinking:
+                    _asst_prefix += "<think>\n\n</think>\n\n"
+                conv_text = f"<|im_start|>user\n{actual_question}<|im_end|>\n{_asst_prefix}"
 
                 if past_kv is not None:
                     input_ids = self.tokenizer.encode(conv_text, return_tensors="pt",
@@ -1042,7 +1048,10 @@ class GAIAEngine:
                     parts.append(f"<|im_start|>system\n[Clock: {utc_str}]<|im_end|>")
                 for msg in conversation:
                     parts.append(f"<|im_start|>{msg['role']}\n{msg['content']}<|im_end|>")
-                parts.append("<|im_start|>assistant\n")
+                if enable_thinking:
+                    parts.append("<|im_start|>assistant\n")
+                else:
+                    parts.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
                 conv_text = "\n".join(parts)
 
                 if past_kv is not None:
@@ -1127,6 +1136,8 @@ class GAIAEngine:
             text = self.tokenizer.decode(generated, skip_special_tokens=True)
             if "<think>" in text:
                 text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+                text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL)
+                text = text.strip()
 
             self._request_count += 1
             self._total_tokens += len(generated)
@@ -1618,10 +1629,12 @@ class EngineHandler(BaseHTTPRequestHandler):
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
                 else:
+                    _template_kwargs = b.get("chat_template_kwargs", {})
                     result = _engine.generate(
                         b.get("messages", []), b.get("max_tokens", 512),
                         b.get("temperature", 0.7), b.get("top_p", 0.9),
-                        skip_prefix=b.get("skip_prefix", False))
+                        skip_prefix=b.get("skip_prefix", False),
+                        enable_thinking=_template_kwargs.get("enable_thinking", True))
                     self._json(result)
             except Exception as e:
                 logger.exception("Generation failed")

@@ -91,7 +91,7 @@ class ExpertCache:
     evicting least-recently-used entries when the budget is exceeded.
     """
 
-    def __init__(self, max_cached: int = 16):
+    def __init__(self, max_cached: int = 48):
         self.max_cached = max_cached
         self._cache: OrderedDict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
         self._hits = 0
@@ -195,33 +195,44 @@ def _patch_single_experts_module(layer_idx: int, module: nn.Module, cache: Exper
                         top_k_weights: torch.Tensor) -> torch.Tensor:
         """Forward with JIT expert transfer from CPU to GPU via cache."""
         final_hidden_states = torch.zeros_like(hidden_states)
+        device = hidden_states.device
 
         with torch.no_grad():
             expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=num_experts)
             expert_mask = expert_mask.permute(2, 1, 0)
             expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
 
+        # Phase 1: batch-prefetch all needed experts to GPU
+        expert_weights = {}  # {expert_idx: (gate_up_gpu, down_gpu)}
+        needs_sync = False
         for expert_idx_tensor in expert_hit:
-            expert_idx = expert_idx_tensor[0].item()
-            if expert_idx == num_experts:
+            eidx = expert_idx_tensor[0].item()
+            if eidx == num_experts:
+                continue
+            cached = cache.get(layer_idx, eidx)
+            if cached is not None:
+                expert_weights[eidx] = cached
+            else:
+                # Non-blocking transfer — batch all transfers before sync
+                gu = cpu_gate_up[eidx].to(device, non_blocking=True)
+                dn = cpu_down[eidx].to(device, non_blocking=True)
+                expert_weights[eidx] = (gu, dn)
+                cache.put(layer_idx, eidx, gu, dn)
+                needs_sync = True
+
+        if needs_sync:
+            torch.cuda.synchronize()
+
+        # Phase 2: compute with all experts already on GPU
+        for expert_idx_tensor in expert_hit:
+            eidx = expert_idx_tensor[0].item()
+            if eidx == num_experts or eidx not in expert_weights:
                 continue
 
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            top_k_pos, token_idx = torch.where(expert_mask[eidx])
             current_state = hidden_states[token_idx]
+            gate_up_gpu, down_gpu = expert_weights[eidx]
 
-            # Get expert weights from cache or transfer from CPU
-            cached = cache.get(layer_idx, expert_idx)
-            if cached is not None:
-                gate_up_gpu, down_gpu = cached
-            else:
-                # Slice from packed CPU tensor and transfer to GPU
-                gate_up_gpu = cpu_gate_up[expert_idx].to(
-                    hidden_states.device, non_blocking=True)
-                down_gpu = cpu_down[expert_idx].to(
-                    hidden_states.device, non_blocking=True)
-                cache.put(layer_idx, expert_idx, gate_up_gpu, down_gpu)
-
-            # Forward pass with GPU-resident slices
             gate, up = nn.functional.linear(current_state, gate_up_gpu).chunk(2, dim=-1)
             current_hidden_states = act_fn(gate) * up
             current_hidden_states = nn.functional.linear(current_hidden_states, down_gpu)

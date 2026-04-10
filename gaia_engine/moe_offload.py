@@ -32,38 +32,51 @@ def is_moe_model(config: dict) -> bool:
 
 
 def build_moe_device_map(model_path: str) -> Dict[str, str]:
-    """Build a device map that places foundation on GPU and experts on CPU.
+    """Build a module-level device map for accelerate's dispatch_model.
 
-    Reads the safetensors index to enumerate all weight keys, then assigns:
-    - GPU: self_attn.*, mlp.* (shared expert), router.*, embed_tokens, norms
-    - CPU: experts.* (128 private experts as packed 3D tensors)
-    - CPU: vision_tower.* (loaded on demand)
+    Places foundation modules (shared MLP, attention, router, norms) on GPU
+    and expert modules on CPU. Uses module paths, not weight names.
+
+    For Gemma 4 26B-A4B the module hierarchy is:
+      model.language_model.layers.{N}.self_attn → GPU
+      model.language_model.layers.{N}.mlp → GPU (shared expert)
+      model.language_model.layers.{N}.router → GPU
+      model.language_model.layers.{N}.experts → CPU
+      model.language_model.layers.{N}.*_layernorm* → GPU
+      model.language_model.embed_tokens → GPU
+      model.language_model.norm → GPU
+      model.vision_tower → CPU
     """
     import json
     from pathlib import Path
 
-    index_path = Path(model_path) / "model.safetensors.index.json"
-    if not index_path.exists():
-        raise FileNotFoundError(f"No safetensors index at {index_path}")
+    config_path = Path(model_path) / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"No config.json at {config_path}")
 
-    with open(index_path) as f:
-        index = json.load(f)
+    with open(config_path) as f:
+        config = json.load(f)
 
-    device_map = {}
-    expert_keys = 0
-    gpu_keys = 0
+    text_cfg = config.get("text_config", config)
+    num_layers = text_cfg.get("num_hidden_layers", 30)
 
-    for key in index["weight_map"]:
-        if ".experts." in key:
-            device_map[key] = "cpu"
-            expert_keys += 1
-        elif "vision_tower" in key:
-            device_map[key] = "cpu"
-        else:
-            device_map[key] = "cuda:0"
-            gpu_keys += 1
+    # Use "auto"-style mapping: place everything on GPU by default,
+    # then override only the experts to CPU. accelerate handles leaf
+    # parameter assignment when the parent module is assigned.
+    device_map = {
+        "": "cuda:0",  # default: everything on GPU
+    }
 
-    logger.info("MoE device map: %d keys on GPU, %d expert keys on CPU", gpu_keys, expert_keys)
+    # Override: experts → CPU (these are the large 3D packed tensors)
+    for layer in range(num_layers):
+        device_map[f"model.language_model.layers.{layer}.experts"] = "cpu"
+
+    # Override: vision tower → CPU (loaded on demand)
+    device_map["model.vision_tower"] = "cpu"
+    device_map["model.embed_vision"] = "cpu"
+
+    logger.info("MoE device map: foundation→GPU, %d expert modules→CPU, vision→CPU",
+                num_layers)
     return device_map
 
 
@@ -249,31 +262,54 @@ def load_moe_offloaded(model_path: str, device: str = "cuda",
                 use_nf4, max_cached_experts)
     start = time.time()
 
-    if use_nf4:
-        import bitsandbytes  # noqa: F401
-        nf4_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            trust_remote_code=True,
-            quantization_config=nf4_config,
-            device_map=device_map,
-            low_cpu_mem_usage=True,
-            attn_implementation="sdpa",
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
-            device_map=device_map,
-            low_cpu_mem_usage=True,
-            attn_implementation="sdpa",
-        )
+    # Strategy: Load bf16 to CPU, then manually .to(cuda) non-expert modules.
+    #
+    # NF4 + split device_map is blocked by transformers. accelerate dispatch
+    # has compatibility issues with Params4bit. So we do it ourselves:
+    # 1. Load bf16 to CPU (whole model in system RAM)
+    # 2. Walk the module tree, move everything EXCEPT experts to GPU
+    # 3. Experts stay on CPU; our patched forward handles JIT transfer
+    #
+    # bf16 foundation on GPU: ~4.5GB (attn + shared MLP + router + norms + embeds)
+    # bf16 experts on CPU: ~45GB (128 experts × 30 layers in system RAM)
+    logger.info("Loading bf16 model to CPU (low_cpu_mem_usage)...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        dtype=torch.bfloat16,
+        device_map="cpu",
+        low_cpu_mem_usage=True,
+        attn_implementation="sdpa",
+    )
+
+    # Manually move foundation to GPU, skip experts
+    # Walk named_parameters for complete coverage (catches raw params like layer_scalar)
+    logger.info("Moving foundation to GPU (skipping experts)...")
+    _moved = 0
+    _skipped = 0
+    for name, param in list(model.named_parameters()):
+        if ".experts." in name or ".experts" == name.split(".")[-1]:
+            _skipped += 1
+            continue
+        if "vision_tower" in name or "embed_vision" in name:
+            _skipped += 1
+            continue
+        if param.device.type != "cuda":
+            # Move parameter to GPU in-place
+            param.data = param.data.to("cuda")
+            _moved += 1
+
+    # Also move any buffers (non-parameter tensors like running stats)
+    for name, buf in list(model.named_buffers()):
+        if ".experts." in name:
+            continue
+        if "vision_tower" in name or "embed_vision" in name:
+            continue
+        if buf.device.type != "cuda":
+            buf.data = buf.data.to("cuda")
+
+    logger.info("Moved %d parameters to GPU, %d expert params remain on CPU", _moved, _skipped)
+    torch.cuda.empty_cache()
 
     model.eval()
     elapsed = time.time() - start

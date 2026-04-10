@@ -23,7 +23,7 @@ classifiers = [
 
 dependencies = [
     "torch>=2.7",
-    "transformers>=5.0",
+    "transformers>=5.5.0",  # Gemma 4 (gemma4 model_type) support
     "accelerate",
     "peft",
     "bitsandbytes",

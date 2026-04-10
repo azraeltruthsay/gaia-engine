@@ -589,13 +589,32 @@ class GAIAEngine:
         except Exception:
             pass
 
+        # Detect MoE architecture — use expert offloading for large MoE on GPU
+        self._expert_cache = None
+        _moe_loaded = False
+        from gaia_engine.moe_offload import is_moe_model
+        _is_moe = is_moe_model(_model_config)
+        if _is_moe and device == "cuda":
+            _disable = os.environ.get("GAIA_ENGINE_MOE_OFFLOAD", "").lower() == "false"
+            if not _disable:
+                num_experts = _model_config.get("text_config", _model_config).get("num_experts", 0)
+                logger.info("MoE detected (%d experts) — loading with expert offloading", num_experts)
+                from gaia_engine.moe_offload import load_moe_offloaded
+                max_cached = int(os.environ.get("GAIA_ENGINE_EXPERT_CACHE", "16"))
+                self.model, self._expert_cache = load_moe_offloaded(
+                    model_path, device=device, max_cached_experts=max_cached,
+                    use_nf4=True,
+                )
+                _moe_loaded = True
+
         # Estimate model size BEFORE loading to decide quantization strategy
-        # Check config.json for num_params or estimate from file sizes
-        # GAIA_ENGINE_QUANTIZE=nf4 forces NF4 regardless of size estimation
+        # (skip if already loaded via MoE offloading path above)
         use_nf4 = os.environ.get("GAIA_ENGINE_QUANTIZE", "").lower() == "nf4"
-        if use_nf4:
+        if _moe_loaded:
+            use_nf4 = True  # MoE path already used NF4
+        elif use_nf4:
             logger.info("NF4 quantization forced via GAIA_ENGINE_QUANTIZE=nf4")
-        if not use_nf4 and device == "cuda" and torch.cuda.is_available() and not is_prequantized:
+        if not use_nf4 and not _moe_loaded and device == "cuda" and torch.cuda.is_available() and not is_prequantized:
             try:
                 import json as _json
                 config_path = Path(model_path) / "config.json"
@@ -619,7 +638,8 @@ class GAIAEngine:
                 logger.debug("Size estimation failed: %s — loading normally", e)
 
         # Load model — use NF4 if needed, otherwise bf16
-        if use_nf4:
+        # (skip entirely if MoE offloading already loaded the model)
+        if use_nf4 and not _moe_loaded:
             try:
                 import bitsandbytes as bnb
                 from transformers import BitsAndBytesConfig
@@ -651,7 +671,7 @@ class GAIAEngine:
                 logger.warning("NF4 load failed (%s) — falling back to bf16", e)
                 use_nf4 = False
 
-        if not use_nf4:
+        if not use_nf4 and not _moe_loaded:
             if self.has_vision:
                 from transformers import AutoModelForImageTextToText
                 try:
@@ -673,14 +693,16 @@ class GAIAEngine:
                     attn_implementation="sdpa",
                 )
 
-        # Move bf16 model to GPU (skip if NF4 already loaded on GPU)
-        if device == "cuda" and torch.cuda.is_available() and not use_nf4:
+        # Move bf16 model to GPU (skip if NF4 or MoE offloading already handled placement)
+        if device == "cuda" and torch.cuda.is_available() and not use_nf4 and not _moe_loaded:
             self.model = self.model.to("cuda")
-        self.model.eval()
+        if not _moe_loaded:
+            self.model.eval()
 
         # Compile for speed — disable CUDA graphs to avoid conflicts
         # with dynamic KV cache sizes in autoregressive generation
-        if compile_mode != "none" and device == "cuda":
+        # Skip for MoE offloaded models — torch.compile doesn't support split device maps
+        if compile_mode != "none" and device == "cuda" and not _moe_loaded:
             try:
                 torch._dynamo.config.suppress_errors = True
                 self.model = torch.compile(
@@ -1613,7 +1635,7 @@ class GAIAEngine:
 
     def status(self) -> dict:
         mem = torch.cuda.memory_allocated() // (1024**2) if self.device == "cuda" else 0
-        return {
+        result = {
             "model": self.model_path,
             "device": self.device,
             "vram_mb": mem,
@@ -1625,6 +1647,9 @@ class GAIAEngine:
             "polygraph": self.monitor.stats(),
             "thoughts": self.thoughts.list_all(),
         }
+        if self._expert_cache is not None:
+            result["expert_cache"] = self._expert_cache.stats()
+        return result
 
 
 # ── HTTP Server ──────────────────────────────────────────────────────────────

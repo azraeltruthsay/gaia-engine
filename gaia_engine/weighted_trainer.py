@@ -31,14 +31,21 @@ def evaluate_sample(model, tokenizer, instruction: str, expected_output: str,
     """
     import torch
 
-    prompt = f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{instruction}<|im_end|>\n<|im_start|>assistant\n"
+    from gaia_engine.core import ChatFormatter
+    fmt = ChatFormatter(tokenizer)
+    prompt = (fmt.format_system(system_prompt) + "\n"
+              + fmt.format_message("user", instruction) + "\n"
+              + fmt.assistant_prefix(enable_thinking=True))
     ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
 
     with torch.no_grad():
         out = model.generate(ids, max_new_tokens=max_tokens, do_sample=False,
                               pad_token_id=tokenizer.eos_token_id)
     answer = tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
-    answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip()
+    # Strip think blocks (model-family-aware)
+    answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL)
+    answer = re.sub(r"<\|think\|>.*?<\|think\|>", "", answer, flags=re.DOTALL)
+    answer = answer.strip()
 
     # Score: check how many key terms from expected output appear in answer
     expected_lower = expected_output.lower()
@@ -105,7 +112,8 @@ def pre_evaluate(model, tokenizer, samples: List[Dict],
 def build_weighted_dataset(eval_results: List[Dict],
                             fail_weight: int = 5,
                             low_confidence_weight: int = 3,
-                            pass_weight: int = 1) -> List[Dict]:
+                            pass_weight: int = 1,
+                            model_family: str = "chatml") -> List[Dict]:
     """Build a weighted training dataset based on eval results.
 
     Failed samples are repeated more, passed samples less.
@@ -113,7 +121,11 @@ def build_weighted_dataset(eval_results: List[Dict],
     """
 
     def fmt(s):
-        return "<|im_start|>user\n" + s["instruction"] + "<|im_end|>\n<|im_start|>assistant\n" + s["output"] + "<|im_end|>"
+        if model_family == "gemma4":
+            return ("<|turn>user<turn|>\n" + s["instruction"] + "\n"
+                    + "<|turn>assistant<turn|>\n" + s["output"])
+        return ("<|im_start|>user\n" + s["instruction"] + "<|im_end|>\n"
+                + "<|im_start|>assistant\n" + s["output"] + "<|im_end|>")
 
     weighted = []
     stats = {"failed": 0, "low_conf": 0, "passed": 0}

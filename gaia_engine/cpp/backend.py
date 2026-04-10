@@ -338,13 +338,31 @@ class GaiaCppBackendAdapter:
     # ── Prompt formatting ─────────────────────────────────────────────────────
 
     def _build_prompt(self, messages: list, enable_thinking: bool = True) -> str:
-        """
-        Build ChatML-formatted prompt for Qwen3/Qwen2 models.
-        Matches the template llama-server uses for these model families.
+        """Build formatted prompt for the model family.
 
-        When enable_thinking=False, injects an empty <think> block after the
-        assistant start token to suppress Qwen3's chain-of-thought mode.
+        Currently supports ChatML (Qwen) and Gemma 4 turn format.
+        The cpp/GGUF backend detects model family from the model path.
+
+        When enable_thinking=False, injects an empty think block after the
+        assistant start token to suppress chain-of-thought mode.
         """
+        # Detect model family from path (cpp backend has no tokenizer)
+        model_path = getattr(self, '_model_path', '') or ''
+        is_gemma = 'gemma' in model_path.lower()
+
+        if is_gemma:
+            parts = []
+            for msg in messages:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                parts.append(f"<|turn>{role}<turn|>\n{content}")
+            if enable_thinking:
+                parts.append("<|turn>assistant<turn|>\n")
+            else:
+                parts.append("<|turn>assistant<turn|>\n<|think|>\n\n<|think|>\n\n")
+            return "\n".join(parts)
+
+        # ChatML (Qwen/default)
         parts = []
         for msg in messages:
             role = msg.get("role", "user")

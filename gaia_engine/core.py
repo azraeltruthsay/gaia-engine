@@ -275,15 +275,104 @@ class ThoughtManager:
         return False
 
 
+# ── Chat Template Formatting ────────────────────────────────────────────────
+
+class ChatFormatter:
+    """Model-family-aware message formatting.
+
+    Replaces hardcoded ChatML (<|im_start|>/<|im_end|>) with dynamic
+    formatting based on the tokenizer's special tokens. Supports:
+    - Qwen (ChatML): <|im_start|>role\\n...<|im_end|>
+    - Gemma 4: <|turn>role<turn|>...
+    - Fallback: ChatML (safe default for unknown models)
+    """
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.family = self._detect_family()
+        logger.info("ChatFormatter: detected model family '%s'", self.family)
+
+    def _detect_family(self) -> str:
+        """Detect model family from tokenizer special tokens."""
+        # Gemma 4: has sot_token (<|turn>) and eot_token (<turn|>)
+        if getattr(self.tokenizer, 'sot_token', None) == '<|turn>':
+            return "gemma4"
+        # Qwen/ChatML: vocab contains <|im_start|>
+        vocab = getattr(self.tokenizer, 'vocab', None) or {}
+        if isinstance(vocab, dict) and '<|im_start|>' in vocab:
+            return "chatml"
+        # Also check via encode — some tokenizers don't expose vocab dict
+        try:
+            ids = self.tokenizer.encode('<|im_start|>', add_special_tokens=False)
+            if len(ids) == 1:
+                return "chatml"
+        except Exception:
+            pass
+        return "chatml"  # safe default
+
+    def format_message(self, role: str, content: str) -> str:
+        """Format a single message with role tags."""
+        if self.family == "gemma4":
+            return f"<|turn>{role}<turn|>\n{content}"
+        return f"<|im_start|>{role}\n{content}<|im_end|>"
+
+    def format_system(self, content: str) -> str:
+        """Format a system message."""
+        return self.format_message("system", content)
+
+    def assistant_prefix(self, enable_thinking: bool = True) -> str:
+        """Return the assistant generation prefix with optional think suppression."""
+        if self.family == "gemma4":
+            prefix = "<|turn>assistant<turn|>\n"
+            if not enable_thinking:
+                prefix += "<|think|>\n\n<|think|>\n\n"
+            return prefix
+        # ChatML
+        prefix = "<|im_start|>assistant\n"
+        if not enable_thinking:
+            prefix += "<think>\n\n</think>\n\n"
+        return prefix
+
+    def format_conversation(self, messages: list, enable_thinking: bool = True,
+                            add_generation_prompt: bool = True) -> str:
+        """Format a full conversation (system + user/assistant turns + generation prompt).
+
+        Args:
+            messages: List of {"role": ..., "content": ...} dicts
+            enable_thinking: Whether to allow model thinking
+            add_generation_prompt: Whether to append assistant prefix for generation
+        """
+        parts = []
+        for msg in messages:
+            parts.append(self.format_message(msg["role"], msg.get("content", "")))
+        if add_generation_prompt:
+            parts.append(self.assistant_prefix(enable_thinking))
+        return "\n".join(parts)
+
+    @property
+    def think_token(self) -> str:
+        """Return the thinking token for this model family."""
+        if self.family == "gemma4":
+            return "<|think|>"
+        return "<think>"
+
+    @property
+    def eos_token_id(self) -> int:
+        """Return the EOS token ID (never hardcoded)."""
+        return self.tokenizer.eos_token_id
+
+
 # ── KV Prefix Cache ──────────────────────────────────────────────────────────
 
 class PrefixCache:
     """Segmented KV prefix cache with hash-based invalidation."""
 
-    def __init__(self, model, tokenizer, device: str = "cuda"):
+    def __init__(self, model, tokenizer, device: str = "cuda",
+                 formatter: Optional[ChatFormatter] = None):
         self.model = model
         self.tokenizer = tokenizer
         self.device = "cuda" if device == "gpu" else device
+        self.formatter = formatter or ChatFormatter(tokenizer)
         self.segments = {"identity": "", "tools": "", "world_state": "", "behavioral": ""}
         self._hashes: Dict[str, str] = {}
         self._cached_kv = None
@@ -315,7 +404,7 @@ class PrefixCache:
         if not prefix.strip():
             return None, 0
 
-        text = f"<|im_start|>system\n{prefix}<|im_end|>\n"
+        text = self.formatter.format_system(prefix) + "\n"
         ids = self.tokenizer.encode(text, return_tensors="pt").to(self.device)
 
         out = self.model(ids, use_cache=True)
@@ -326,6 +415,86 @@ class PrefixCache:
         logger.info("KV prefix recomputed (%d tokens, segments: %s)",
                      self._cached_len, list(self._hashes.keys()))
         return self._cached_kv, self._cached_len
+
+    def invalidate(self):
+        self._cached_kv = None
+        self._hashes = {}
+
+    def save_state(self, path: str) -> bool:
+        """Save KV cache state to disk for cross-device portability.
+
+        Saves the cached prefix KV tensors + segment hashes + text so
+        the cache can be restored on a different device (GPU→CPU or CPU→GPU).
+        Tensors are saved as CPU float32 for maximum compatibility.
+        """
+        if self._cached_kv is None:
+            logger.debug("PrefixCache.save_state: no cached KV to save")
+            return False
+
+        import torch
+        save_path = Path(path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Convert KV tuples to CPU float32 tensors for portability
+        kv_cpu = []
+        for layer_kv in self._cached_kv:
+            layer_tensors = []
+            for t in layer_kv:
+                layer_tensors.append(t.detach().cpu().float())
+            kv_cpu.append(tuple(layer_tensors))
+
+        state = {
+            "kv_cache": kv_cpu,
+            "prefix_len": self._cached_len,
+            "segments": dict(self.segments),
+            "hashes": dict(self._hashes),
+            "device_saved_from": str(self.device),
+        }
+        torch.save(state, str(save_path))
+        logger.info("PrefixCache saved: %d tokens, %d layers → %s",
+                     self._cached_len, len(kv_cpu), path)
+        return True
+
+    def load_state(self, path: str) -> bool:
+        """Load KV cache state from disk, casting to current device/dtype.
+
+        Restores a previously saved prefix cache, handling GPU↔CPU transitions
+        and dtype differences (fp32 on disk → fp16/bf16 on GPU).
+        """
+        import torch
+        save_path = Path(path)
+        if not save_path.exists():
+            logger.debug("PrefixCache.load_state: file not found: %s", path)
+            return False
+
+        state = torch.load(str(save_path), map_location="cpu", weights_only=False)
+
+        # Determine target dtype from the model's parameters
+        target_dtype = torch.float32
+        try:
+            for p in self.model.parameters():
+                target_dtype = p.dtype
+                break
+        except Exception:
+            pass
+
+        # Cast KV tensors to target device and dtype
+        kv_restored = []
+        for layer_kv in state["kv_cache"]:
+            layer_tensors = []
+            for t in layer_kv:
+                layer_tensors.append(t.to(device=self.device, dtype=target_dtype))
+            kv_restored.append(tuple(layer_tensors))
+
+        self._cached_kv = tuple(kv_restored)
+        self._cached_len = state["prefix_len"]
+        self.segments = state.get("segments", self.segments)
+        self._hashes = state.get("hashes", {})
+
+        saved_from = state.get("device_saved_from", "unknown")
+        logger.info("PrefixCache loaded: %d tokens, %d layers (%s → %s, dtype=%s)",
+                     self._cached_len, len(kv_restored), saved_from, self.device, target_dtype)
+        return True
 
     def invalidate(self):
         self._cached_kv = None
@@ -530,7 +699,9 @@ class GAIAEngine:
             pass
 
         # Initialize subsystems
-        self.prefix_cache = PrefixCache(self.model, self.tokenizer, device)
+        self.formatter = ChatFormatter(self.tokenizer)
+        self.prefix_cache = PrefixCache(self.model, self.tokenizer, device,
+                                        formatter=self.formatter)
 
         # Load behavioral cache examples if available
         _behavioral_path = os.path.join(
@@ -972,7 +1143,7 @@ class GAIAEngine:
                     if msg.get("role") == "assistant" and ("AM" in content or "PM" in content):
                         content = _re.sub(r"It's [^.]+\.", f"It's {local_simple}.", content)
                         content = _re.sub(r"it's [^.]+\.", f"it's {local_simple}.", content)
-                    fewshot_parts.append(f"<|im_start|>{msg['role']}\n{content}<|im_end|>")
+                    fewshot_parts.append(self.formatter.format_message(msg['role'], content))
                 fewshot_text = "\n".join(fewshot_parts)
 
                 # Cache as segments — invalidated when clock minute changes
@@ -984,17 +1155,15 @@ class GAIAEngine:
 
                 # Dynamic part: only the user's actual question (~10 tokens)
                 actual_question = conversation[-1].get("content", "") if conversation else ""
-                _asst_prefix = "<|im_start|>assistant\n"
-                if not enable_thinking:
-                    _asst_prefix += "<think>\n\n</think>\n\n"
-                conv_text = f"<|im_start|>user\n{actual_question}<|im_end|>\n{_asst_prefix}"
+                conv_text = (self.formatter.format_message("user", actual_question)
+                             + "\n" + self.formatter.assistant_prefix(enable_thinking))
 
                 if past_kv is not None:
                     input_ids = self.tokenizer.encode(conv_text, return_tensors="pt",
                                                        add_special_tokens=False).to(self.model.device)
                     total_input = prefix_len + input_ids.shape[1]
                 else:
-                    full = f"<|im_start|>system\n{system}<|im_end|>\n{fewshot_text}\n{conv_text}"
+                    full = self.formatter.format_system(system) + "\n" + fewshot_text + "\n" + conv_text
                     input_ids = self.tokenizer.encode(full, return_tensors="pt").to(self.model.device)
                     total_input = input_ids.shape[1]
 
@@ -1044,17 +1213,14 @@ class GAIAEngine:
                 # Clock injection (Core/Prime get dual format)
                 parts = []
                 if local_str and date_str:
-                    parts.append(f"<|im_start|>system\n[Clock: {local_str}, {date_str} | {utc_str}]<|im_end|>")
+                    parts.append(self.formatter.format_system(f"[Clock: {local_str}, {date_str} | {utc_str}]"))
                 elif local_str:
-                    parts.append(f"<|im_start|>system\n[Clock: {local_str} | {utc_str}]<|im_end|>")
+                    parts.append(self.formatter.format_system(f"[Clock: {local_str} | {utc_str}]"))
                 else:
-                    parts.append(f"<|im_start|>system\n[Clock: {utc_str}]<|im_end|>")
+                    parts.append(self.formatter.format_system(f"[Clock: {utc_str}]"))
                 for msg in conversation:
-                    parts.append(f"<|im_start|>{msg['role']}\n{msg['content']}<|im_end|>")
-                if enable_thinking:
-                    parts.append("<|im_start|>assistant\n")
-                else:
-                    parts.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+                    parts.append(self.formatter.format_message(msg['role'], msg['content']))
+                parts.append(self.formatter.assistant_prefix(enable_thinking))
                 conv_text = "\n".join(parts)
 
                 if past_kv is not None:
@@ -1062,7 +1228,7 @@ class GAIAEngine:
                                                        add_special_tokens=False).to(self.model.device)
                     total_input = prefix_len + input_ids.shape[1]
                 else:
-                    full = f"<|im_start|>system\n{system}<|im_end|>\n{conv_text}" if system else conv_text
+                    full = self.formatter.format_system(system) + "\n" + conv_text if system else conv_text
                     input_ids = self.tokenizer.encode(full, return_tensors="pt").to(self.model.device)
                     total_input = input_ids.shape[1]
 
@@ -1090,11 +1256,11 @@ class GAIAEngine:
             del out  # Free full output immediately
 
             # Autoregressive loop — minimal overhead, with entropy tracking
-            eos_id = self.tokenizer.eos_token_id
-            # Suppress <think> token — Qwen3.5 defaults to thinking mode.
+            eos_id = self.formatter.eos_token_id
+            # Suppress think token — model defaults to thinking mode.
             # We mask it in logits so the model generates the answer directly.
-            # Token ID varies by model family — resolve dynamically
-            _think_token_id = self.tokenizer.convert_tokens_to_ids("<think>")
+            # Token ID varies by model family — resolve dynamically via formatter
+            _think_token_id = self.tokenizer.convert_tokens_to_ids(self.formatter.think_token)
             if _think_token_id is None or _think_token_id == self.tokenizer.unk_token_id:
                 _think_token_id = -1  # Not in vocab — skip suppression
             _entropy_sum = 0.0
@@ -1237,21 +1403,19 @@ class GAIAEngine:
                     conversation.append(msg)
 
             # Build prompt
-            parts = []
+            all_msgs = []
             if system:
-                parts.append(f"<|im_start|>system\n{system}<|im_end|>")
-            for msg in conversation:
-                parts.append(f"<|im_start|>{msg['role']}\n{msg.get('content', '')}<|im_end|>")
-            parts.append("<|im_start|>assistant\n")
-            prompt = "\n".join(parts)
+                all_msgs.append({"role": "system", "content": system})
+            all_msgs.extend(conversation)
+            prompt = self.formatter.format_conversation(all_msgs, enable_thinking=True)
 
             input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.model.device)
-            eos_id = self.tokenizer.eos_token_id or 151643
+            eos_id = self.formatter.eos_token_id
 
-            # Suppress <think> token
+            # Suppress think token (model-family-aware)
             _think_token_id = -1
             try:
-                _ids = self.tokenizer.encode("<think>", add_special_tokens=False)
+                _ids = self.tokenizer.encode(self.formatter.think_token, add_special_tokens=False)
                 if _ids:
                     _think_token_id = _ids[-1]
             except Exception:
@@ -1674,6 +1838,18 @@ class EngineHandler(BaseHTTPRequestHandler):
         elif self.path == "/cache/invalidate":
             _engine.prefix_cache.invalidate()
             self._json({"ok": True})
+        elif self.path == "/cache/save":
+            b = self._body()
+            save_path = b.get("path", "/shared/kvcache/prefix_state.pt")
+            ok = _engine.prefix_cache.save_state(save_path)
+            self._json({"ok": ok, "path": save_path,
+                         "prefix_tokens": _engine.prefix_cache._cached_len})
+        elif self.path == "/cache/load":
+            b = self._body()
+            load_path = b.get("path", "/shared/kvcache/prefix_state.pt")
+            ok = _engine.prefix_cache.load_state(load_path)
+            self._json({"ok": ok, "path": load_path,
+                         "prefix_tokens": _engine.prefix_cache._cached_len if ok else 0})
         elif self.path == "/thought/hold":
             b = self._body()
             pc = _engine.prefix_cache

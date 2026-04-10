@@ -125,9 +125,11 @@ class AdapterSurgeon:
         """Get hidden state activations for a prompt at specified layers."""
         import torch
 
-        full = (f"<|im_start|>system\nYou are GAIA, a sovereign AI created by Azrael.<|im_end|>\n"
-                f"<|im_start|>user\n{prompt}<|im_end|>\n"
-                f"<|im_start|>assistant\n")
+        from gaia_engine.core import ChatFormatter
+        fmt = ChatFormatter(self.tokenizer)
+        full = (fmt.format_system("You are GAIA, a sovereign AI created by Azrael.")
+                + "\n" + fmt.format_message("user", prompt)
+                + "\n" + fmt.assistant_prefix(enable_thinking=True))
         ids = self.tokenizer.encode(full, return_tensors="pt").to(self.device)
 
         with torch.no_grad():

@@ -100,10 +100,13 @@ class SAETrainer:
         logger.info("Recording activations for %d prompts at layers %s", len(prompts), layers)
         start = time.time()
 
+        from gaia_engine.core import ChatFormatter
+        _fmt = ChatFormatter(self.tokenizer)
+
         for i, prompt_text in enumerate(prompts):
-            full = (f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-                    f"<|im_start|>user\n{prompt_text}<|im_end|>\n"
-                    f"<|im_start|>assistant\n")
+            full = (_fmt.format_system(system_prompt) + "\n"
+                    + _fmt.format_message("user", prompt_text) + "\n"
+                    + _fmt.assistant_prefix(enable_thinking=True))
             ids = self.tokenizer.encode(full, return_tensors="pt").to(self.device)
             total_tokens += ids.shape[1]
 
@@ -285,6 +288,38 @@ class SAETrainer:
 
         logger.info("Atlas saved to %s (%d layers)", path, len(self.saes))
 
+    def load_atlas(self, path: str):
+        """Load a previously saved SAE atlas from disk.
+
+        Populates self.saes and self.feature_labels so analyze_prompt() works.
+        """
+        atlas_dir = Path(path)
+        if not atlas_dir.exists():
+            raise FileNotFoundError(f"Atlas directory not found: {path}")
+
+        loaded = 0
+        for sae_file in sorted(atlas_dir.glob("layer_*.pt")):
+            layer_idx = int(sae_file.stem.split("_")[1])
+            checkpoint = torch.load(sae_file, map_location=self.device, weights_only=True)
+
+            sae = SparseAutoencoder(checkpoint["hidden_size"], checkpoint["num_features"])
+            sae.encoder.weight.data = checkpoint["encoder_weight"].to(self.device)
+            sae.encoder.bias.data = checkpoint["encoder_bias"].to(self.device)
+            sae.decoder.weight.data = checkpoint["decoder_weight"].to(self.device)
+            sae.decoder.bias.data = checkpoint["decoder_bias"].to(self.device)
+            # Norm params stay on CPU (analyze_prompt does hs.cpu() - norm)
+            sae._norm_mean = checkpoint.get("norm_mean", torch.zeros(checkpoint["hidden_size"])).cpu().float()
+            sae._norm_std = checkpoint.get("norm_std", torch.ones(checkpoint["hidden_size"])).cpu().float()
+            sae = sae.to(self.device).eval()
+
+            self.saes[layer_idx] = sae
+            labels = checkpoint.get("labels", {})
+            if labels:
+                self.feature_labels[layer_idx] = labels
+            loaded += 1
+
+        logger.info("Atlas loaded from %s (%d layers)", path, loaded)
+
     def analyze_prompt(self, prompt: str, layer_idx: int,
                         system_prompt: str = "You are GAIA, a sovereign AI.",
                         top_k: int = 20) -> Dict:
@@ -298,9 +333,11 @@ class SAETrainer:
 
         sae = self.saes[layer_idx]
 
-        full = (f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-                f"<|im_start|>user\n{prompt}<|im_end|>\n"
-                f"<|im_start|>assistant\n")
+        from gaia_engine.core import ChatFormatter
+        _fmt = ChatFormatter(self.tokenizer)
+        full = (_fmt.format_system(system_prompt) + "\n"
+                + _fmt.format_message("user", prompt) + "\n"
+                + _fmt.assistant_prefix(enable_thinking=True))
         ids = self.tokenizer.encode(full, return_tensors="pt").to(self.device)
 
         with torch.no_grad():

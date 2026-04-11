@@ -353,25 +353,17 @@ def load_moe_offloaded(model_path: str, device: str = "cuda",
     # hooks that break the autograd graph after .to("cuda"). Instead use
     # low_cpu_mem_usage=True which loads to CPU without dispatch infrastructure.
     logger.info("Loading bf16 model to CPU (low_cpu_mem_usage, no device_map)...")
-    try:
-        from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
-        model = Gemma4ForCausalLM.from_pretrained(
-            model_path,
-            trust_remote_code=True,
-            dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-            attn_implementation="sdpa",
-        )
-        logger.info("Loaded as Gemma4ForCausalLM (text-only, gradient-compatible)")
-    except (ImportError, Exception) as e:
-        logger.info("Gemma4ForCausalLM not available (%s), using AutoModelForCausalLM", e)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            trust_remote_code=True,
-            dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-            attn_implementation="sdpa",
-        )
+    # Use AutoModelForCausalLM for inference (resolves to Gemma4ForConditionalGeneration
+    # which handles generation correctly). For TRAINING, callers should use
+    # Gemma4ForCausalLM directly (text-only, gradient-compatible).
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        attn_implementation="sdpa",
+    )
+    logger.info("Loaded as %s", type(model).__name__)
 
     # Manually move foundation to GPU, skip experts
     # Walk named_parameters for complete coverage (catches raw params like layer_scalar)

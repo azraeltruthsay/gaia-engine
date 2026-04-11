@@ -31,6 +31,28 @@ def is_moe_model(config: dict) -> bool:
     return False
 
 
+def unwrap_clippable_linear(model: nn.Module) -> int:
+    """Replace Gemma4ClippableLinear with inner nn.Linear for PEFT compatibility.
+
+    Gemma 4's vision tower uses ClippableLinear wrappers that PEFT doesn't
+    support. Unwrapping them to plain nn.Linear allows PEFT adapter loading
+    without changing model behavior.
+
+    Returns number of modules replaced.
+    """
+    replaced = 0
+    for name, module in list(model.named_modules()):
+        if type(module).__name__ == "Gemma4ClippableLinear":
+            parts = name.rsplit(".", 1)
+            if len(parts) == 2:
+                parent = model.get_submodule(parts[0])
+                setattr(parent, parts[1], module.linear)
+                replaced += 1
+    if replaced:
+        logger.info("Unwrapped %d ClippableLinear modules for PEFT compatibility", replaced)
+    return replaced
+
+
 def build_moe_device_map(model_path: str) -> Dict[str, str]:
     """Build a module-level device map for accelerate's dispatch_model.
 

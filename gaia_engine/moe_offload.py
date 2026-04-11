@@ -180,9 +180,8 @@ class ExpertBridgeFunction(torch.autograd.Function):
         # Sum of routing weights per token: [batch*seq, top_k] → [batch*seq, 1]
         weight_sum = top_k_weights.sum(dim=-1, keepdim=True)  # [batch*seq, 1]
 
-        # Scale gradient by weight sum — this is the "Neural Bridge"
-        # grad flows back to hidden_states (input to expert block)
-        grad_hidden = grad_output * weight_sum
+        # Scale gradient by weight sum in fp32 to prevent bf16 overflow
+        grad_hidden = (grad_output.float() * weight_sum.float()).to(grad_output.dtype)
 
         # No gradients for top_k_index, top_k_weights, or expert_fn
         return grad_hidden, None, None, None

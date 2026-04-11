@@ -592,8 +592,11 @@ class GAIAEngine:
         # Detect MoE architecture — use expert offloading for large MoE on GPU
         self._expert_cache = None
         _moe_loaded = False
-        from gaia_engine.moe_offload import is_moe_model
-        _is_moe = is_moe_model(_model_config)
+        try:
+            from gaia_engine.moe_offload import is_moe_model
+            _is_moe = is_moe_model(_model_config)
+        except ImportError:
+            _is_moe = False
         if _is_moe and device == "cuda":
             _disable = os.environ.get("GAIA_ENGINE_MOE_OFFLOAD", "").lower() == "false"
             if not _disable:

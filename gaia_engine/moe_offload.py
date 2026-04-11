@@ -26,7 +26,7 @@ def is_moe_model(config: dict) -> bool:
     if text_cfg.get("enable_moe_block", False):
         return True
     # Also check for num_experts > 1
-    if text_cfg.get("num_experts", 0) > 1:
+    if (text_cfg.get("num_experts") or 0) > 1:
         return True
     return False
 

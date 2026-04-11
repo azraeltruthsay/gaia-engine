@@ -283,15 +283,31 @@ def load_moe_offloaded(model_path: str, device: str = "cuda",
     #
     # bf16 foundation on GPU: ~4.5GB (attn + shared MLP + router + norms + embeds)
     # bf16 experts on CPU: ~45GB (128 experts × 30 layers in system RAM)
+    # Use Gemma4ForCausalLM (text-only) instead of AutoModelForCausalLM which
+    # resolves to Gemma4ForConditionalGeneration (multimodal). The multimodal
+    # wrapper breaks gradient flow, preventing training.
     logger.info("Loading bf16 model to CPU (low_cpu_mem_usage)...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        trust_remote_code=True,
-        dtype=torch.bfloat16,
-        device_map="cpu",
-        low_cpu_mem_usage=True,
-        attn_implementation="sdpa",
-    )
+    try:
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
+        model = Gemma4ForCausalLM.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            dtype=torch.bfloat16,
+            device_map="cpu",
+            low_cpu_mem_usage=True,
+            attn_implementation="sdpa",
+        )
+        logger.info("Loaded as Gemma4ForCausalLM (text-only, gradient-compatible)")
+    except (ImportError, Exception) as e:
+        logger.info("Gemma4ForCausalLM not available (%s), using AutoModelForCausalLM", e)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            dtype=torch.bfloat16,
+            device_map="cpu",
+            low_cpu_mem_usage=True,
+            attn_implementation="sdpa",
+        )
 
     # Manually move foundation to GPU, skip experts
     # Walk named_parameters for complete coverage (catches raw params like layer_scalar)
@@ -322,7 +338,7 @@ def load_moe_offloaded(model_path: str, device: str = "cuda",
     logger.info("Moved %d parameters to GPU, %d expert params remain on CPU", _moved, _skipped)
     torch.cuda.empty_cache()
 
-    model.eval()
+    # Don't call model.eval() here — caller decides train/eval mode
     elapsed = time.time() - start
 
     # Report memory usage

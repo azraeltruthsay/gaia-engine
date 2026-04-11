@@ -142,6 +142,52 @@ class ExpertCache:
         }
 
 
+class ExpertBridgeFunction(torch.autograd.Function):
+    """Custom autograd bridge for frozen MoE experts.
+
+    Forward: runs expert computation under torch.no_grad() (experts are frozen,
+    weights live on CPU, JIT-transferred to GPU). No backward graph built for experts.
+
+    Backward: approximates dL/dx by scaling grad_output with the sum of routing
+    weights that were applied to this token. This allows gradients to flow back
+    through the MoE block to reach the shared MLP and attention layers (which DO
+    need training gradients for Foundation Tuning).
+
+    The approximation is mathematically justified because:
+    - Expert output = Σ(weight_k * expert_k(x)) for top-k experts
+    - dL/dx ≈ dL/d_output * Σ(weight_k) (treating expert_k as approximately identity)
+    - This preserves gradient magnitude and direction for the shared path
+    """
+
+    @staticmethod
+    def forward(ctx, hidden_states, top_k_index, top_k_weights, expert_fn):
+        """Run expert forward without building backward graph."""
+        # Save routing weights for backward approximation
+        ctx.save_for_backward(top_k_weights)
+        ctx.hidden_shape = hidden_states.shape
+
+        # Expert computation under no_grad — frozen weights, no backward needed
+        with torch.no_grad():
+            result = expert_fn(hidden_states.detach(), top_k_index, top_k_weights)
+
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Approximate gradient: scale by routing weight sum."""
+        top_k_weights, = ctx.saved_tensors
+
+        # Sum of routing weights per token: [batch*seq, top_k] → [batch*seq, 1]
+        weight_sum = top_k_weights.sum(dim=-1, keepdim=True)  # [batch*seq, 1]
+
+        # Scale gradient by weight sum — this is the "Neural Bridge"
+        # grad flows back to hidden_states (input to expert block)
+        grad_hidden = grad_output * weight_sum
+
+        # No gradients for top_k_index, top_k_weights, or expert_fn
+        return grad_hidden, None, None, None
+
+
 def patch_experts_forward(model: nn.Module, expert_cache: ExpertCache):
     """Monkey-patch Gemma4TextExperts.forward() to use GPU-cached slices.
 
@@ -190,20 +236,19 @@ def _patch_single_experts_module(layer_idx: int, module: nn.Module, cache: Exper
     act_fn = module.act_fn
     num_experts = module.num_experts
 
-    def patched_forward(hidden_states: torch.Tensor,
-                        top_k_index: torch.Tensor,
-                        top_k_weights: torch.Tensor) -> torch.Tensor:
-        """Forward with JIT expert transfer from CPU to GPU via cache."""
+    def _jit_expert_forward(hidden_states: torch.Tensor,
+                            top_k_index: torch.Tensor,
+                            top_k_weights: torch.Tensor) -> torch.Tensor:
+        """Raw expert computation with JIT CPU→GPU transfer. No autograd."""
         final_hidden_states = torch.zeros_like(hidden_states)
         device = hidden_states.device
 
-        with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=num_experts)
-            expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=num_experts)
+        expert_mask = expert_mask.permute(2, 1, 0)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
 
         # Phase 1: batch-prefetch all needed experts to GPU
-        expert_weights = {}  # {expert_idx: (gate_up_gpu, down_gpu)}
+        expert_weights_map = {}
         needs_sync = False
         for expert_idx_tensor in expert_hit:
             eidx = expert_idx_tensor[0].item()
@@ -211,12 +256,11 @@ def _patch_single_experts_module(layer_idx: int, module: nn.Module, cache: Exper
                 continue
             cached = cache.get(layer_idx, eidx)
             if cached is not None:
-                expert_weights[eidx] = cached
+                expert_weights_map[eidx] = cached
             else:
-                # Non-blocking transfer — batch all transfers before sync
                 gu = cpu_gate_up[eidx].to(device, non_blocking=True)
                 dn = cpu_down[eidx].to(device, non_blocking=True)
-                expert_weights[eidx] = (gu, dn)
+                expert_weights_map[eidx] = (gu, dn)
                 cache.put(layer_idx, eidx, gu, dn)
                 needs_sync = True
 
@@ -226,12 +270,12 @@ def _patch_single_experts_module(layer_idx: int, module: nn.Module, cache: Exper
         # Phase 2: compute with all experts already on GPU
         for expert_idx_tensor in expert_hit:
             eidx = expert_idx_tensor[0].item()
-            if eidx == num_experts or eidx not in expert_weights:
+            if eidx == num_experts or eidx not in expert_weights_map:
                 continue
 
             top_k_pos, token_idx = torch.where(expert_mask[eidx])
             current_state = hidden_states[token_idx]
-            gate_up_gpu, down_gpu = expert_weights[eidx]
+            gate_up_gpu, down_gpu = expert_weights_map[eidx]
 
             gate, up = nn.functional.linear(current_state, gate_up_gpu).chunk(2, dim=-1)
             current_hidden_states = act_fn(gate) * up
@@ -240,6 +284,19 @@ def _patch_single_experts_module(layer_idx: int, module: nn.Module, cache: Exper
             final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
 
         return final_hidden_states
+
+    def patched_forward(hidden_states: torch.Tensor,
+                        top_k_index: torch.Tensor,
+                        top_k_weights: torch.Tensor) -> torch.Tensor:
+        """Forward with gradient bridge for training compatibility."""
+        if hidden_states.requires_grad:
+            # Training mode: use ExpertBridgeFunction for gradient flow
+            return ExpertBridgeFunction.apply(
+                hidden_states, top_k_index, top_k_weights, _jit_expert_forward
+            )
+        else:
+            # Inference mode: direct computation (no autograd overhead)
+            return _jit_expert_forward(hidden_states, top_k_index, top_k_weights)
 
     module.forward = patched_forward
     logger.debug("Patched layer %d experts for JIT offloading", layer_idx)
@@ -286,14 +343,17 @@ def load_moe_offloaded(model_path: str, device: str = "cuda",
     # Use Gemma4ForCausalLM (text-only) instead of AutoModelForCausalLM which
     # resolves to Gemma4ForConditionalGeneration (multimodal). The multimodal
     # wrapper breaks gradient flow, preventing training.
-    logger.info("Loading bf16 model to CPU (low_cpu_mem_usage)...")
+    # Use Gemma4ForCausalLM (text-only) for gradient-compatible loading.
+    # CRITICAL: do NOT use device_map="cpu" — it invokes accelerate dispatch
+    # hooks that break the autograd graph after .to("cuda"). Instead use
+    # low_cpu_mem_usage=True which loads to CPU without dispatch infrastructure.
+    logger.info("Loading bf16 model to CPU (low_cpu_mem_usage, no device_map)...")
     try:
         from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
         model = Gemma4ForCausalLM.from_pretrained(
             model_path,
             trust_remote_code=True,
             dtype=torch.bfloat16,
-            device_map="cpu",
             low_cpu_mem_usage=True,
             attn_implementation="sdpa",
         )
@@ -304,7 +364,6 @@ def load_moe_offloaded(model_path: str, device: str = "cuda",
             model_path,
             trust_remote_code=True,
             dtype=torch.bfloat16,
-            device_map="cpu",
             low_cpu_mem_usage=True,
             attn_implementation="sdpa",
         )

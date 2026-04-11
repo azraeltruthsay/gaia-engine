@@ -7,7 +7,7 @@ name = "gaia-engine"
 version = "1.0.0"
 description = "Purpose-built inference engine for self-aware AI — subprocess isolation, KV thoughts, polygraph, LoRA, SAE, ROME"
 readme = "README.md"
-license = "Apache-2.0"
+license = {text = "Apache-2.0"}
 requires-python = ">=3.11"
 authors = [
     {name = "Azrael", email = "azrael@gaia.local"},

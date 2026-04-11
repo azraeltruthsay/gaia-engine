@@ -240,7 +240,9 @@ def _patch_single_experts_module(layer_idx: int, module: nn.Module, cache: Exper
                             top_k_index: torch.Tensor,
                             top_k_weights: torch.Tensor) -> torch.Tensor:
         """Raw expert computation with JIT CPU→GPU transfer. No autograd."""
-        final_hidden_states = torch.zeros_like(hidden_states)
+        # Accumulate in fp32 to prevent bf16 overflow with 128 experts
+        final_hidden_states = torch.zeros(
+            hidden_states.shape, dtype=torch.float32, device=hidden_states.device)
         device = hidden_states.device
 
         expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=num_experts)
@@ -280,10 +282,14 @@ def _patch_single_experts_module(layer_idx: int, module: nn.Module, cache: Exper
             gate, up = nn.functional.linear(current_state, gate_up_gpu).chunk(2, dim=-1)
             current_hidden_states = act_fn(gate) * up
             current_hidden_states = nn.functional.linear(current_hidden_states, down_gpu)
+            # Clamp to prevent bf16 Inf before weighting (bf16 max ~65504)
+            current_hidden_states = current_hidden_states.clamp(-65000, 65000)
             current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+            # Accumulate in fp32
+            final_hidden_states.index_add_(0, token_idx, current_hidden_states.float())
 
-        return final_hidden_states
+        # Downcast back to input dtype
+        return final_hidden_states.to(hidden_states.dtype)
 
     def patched_forward(hidden_states: torch.Tensor,
                         top_k_index: torch.Tensor,

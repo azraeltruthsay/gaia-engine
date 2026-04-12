@@ -652,21 +652,15 @@ class GAIAEngine:
                     bnb_4bit_quant_type="nf4",
                     bnb_4bit_use_double_quant=True,
                 )
-                # CPU-first NF4: load to CPU, quantize there, then dispatch to GPU
-                # This never holds bf16 weights on GPU — only the 4-bit version
-                logger.info("Loading NF4 to CPU first (avoids bf16 GPU peak)...")
+                # NF4 direct to GPU — quantization happens during loading
+                logger.info("Loading NF4 directly to GPU...")
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_path, trust_remote_code=True,
                     quantization_config=nf4_config,
-                    device_map={"": "cpu"},
+                    device_map="auto",
                     low_cpu_mem_usage=True,
                     attn_implementation="sdpa",
                 )
-                # Move quantized model to GPU — NF4 is ~0.5 bytes/param,
-                # so an 8B model is ~4.5GB, well within GPU budget.
-                # Simple .to("cuda") is more reliable than dispatch_model
-                # which can split layers across CPU/GPU and cause device mismatches.
-                self.model = self.model.to("cuda")
                 torch.cuda.empty_cache()
                 quant_mb = torch.cuda.memory_allocated() / (1024**2)
                 logger.info("NF4 model loaded: %.0fMB on GPU (CPU-first)", quant_mb)

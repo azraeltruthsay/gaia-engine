@@ -546,6 +546,10 @@ class GAIAEngine:
         self.has_vision = "vision_config" in _model_config or \
             "VL" in str(_model_config.get("architectures", "")) or \
             "ConditionalGeneration" in str(_model_config.get("architectures", ""))
+        # Allow disabling vision to save VRAM (skip vision tower loading)
+        if os.environ.get("GAIA_ENGINE_DISABLE_VISION", "").lower() in ("1", "true"):
+            self.has_vision = False
+            logger.info("Vision disabled via GAIA_ENGINE_DISABLE_VISION")
 
         # Load tokenizer / processor
         if self.has_vision:
@@ -695,6 +699,21 @@ class GAIAEngine:
             self.model = self.model.to("cuda")
         if not _moe_loaded:
             self.model.eval()
+
+        # Detach vision tower if disabled — frees ~5GB VRAM on multimodal models
+        if not self.has_vision and hasattr(self.model, "model"):
+            _inner = self.model.model if hasattr(self.model.model, "vision_tower") else self.model
+            if hasattr(_inner, "vision_tower") and _inner.vision_tower is not None:
+                del _inner.vision_tower
+                _inner.vision_tower = None
+                if hasattr(_inner, "embed_vision"):
+                    del _inner.embed_vision
+                    _inner.embed_vision = None
+                gc.collect()
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+                    _freed_mb = torch.cuda.memory_allocated() / (1024**2)
+                    logger.info("Vision tower detached (VRAM now: %.0fMB)", _freed_mb)
 
         # Compile for speed — disable CUDA graphs to avoid conflicts
         # with dynamic KV cache sizes in autoregressive generation

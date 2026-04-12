@@ -218,22 +218,45 @@ class DissociationScanner:
 
     def _load_atlas(self, atlas_path: str):
         """Load SAE models and feature labels from atlas directory."""
+        from gaia_engine.sae_trainer import SparseAutoencoder
+
         atlas_dir = Path(atlas_path)
         if not atlas_dir.exists():
             raise FileNotFoundError(f"SAE atlas not found: {atlas_path}")
 
-        for sae_file in atlas_dir.glob("layer_*.pt"):
+        for sae_file in sorted(atlas_dir.glob("layer_*.pt")):
             layer = int(sae_file.stem.split("_")[1])
-            sae = torch.load(sae_file, map_location=self.device, weights_only=False)
-            self.sae_models[layer] = sae
-            sae.eval()
+            checkpoint = torch.load(sae_file, map_location=self.device, weights_only=True)
 
-        # Load labels if available
+            # Reconstruct the SparseAutoencoder module from checkpoint
+            if isinstance(checkpoint, dict) and "encoder_weight" in checkpoint:
+                sae = SparseAutoencoder(checkpoint["hidden_size"], checkpoint["num_features"])
+                sae.encoder.weight.data = checkpoint["encoder_weight"].to(self.device)
+                sae.encoder.bias.data = checkpoint["encoder_bias"].to(self.device)
+                sae.decoder.weight.data = checkpoint["decoder_weight"].to(self.device)
+                sae.decoder.bias.data = checkpoint["decoder_bias"].to(self.device)
+                sae._norm_mean = checkpoint.get("norm_mean", torch.zeros(checkpoint["hidden_size"])).cpu().float()
+                sae._norm_std = checkpoint.get("norm_std", torch.ones(checkpoint["hidden_size"])).cpu().float()
+                sae = sae.to(self.device).eval()
+
+                # Load per-layer labels from checkpoint
+                labels = checkpoint.get("labels", {})
+                if labels:
+                    self.feature_labels[layer] = labels
+            else:
+                # Legacy format: checkpoint IS the SAE module
+                sae = checkpoint
+                sae.eval()
+
+            self.sae_models[layer] = sae
+
+        # Load standalone labels file if available
         labels_file = atlas_dir / "feature_labels.json"
         if labels_file.exists():
             with open(labels_file) as f:
                 raw = json.load(f)
-                self.feature_labels = {int(k): v for k, v in raw.items()}
+                for k, v in raw.items():
+                    self.feature_labels.setdefault(int(k), {}).update(v)
 
         logger.info("Loaded SAE atlases for %d layers from %s", len(self.sae_models), atlas_path)
 
@@ -266,8 +289,11 @@ class DissociationScanner:
         feature_activations = {}
         for layer_idx, h in layer_activations.items():
             sae = self.sae_models[layer_idx]
+            # Match dtype to SAE weights (model may output fp16, SAE trained in fp32)
+            sae_dtype = sae.encoder.weight.dtype
+            h_cast = h.to(dtype=sae_dtype)
             with torch.no_grad():
-                _, encoded = sae(h.unsqueeze(0))  # (1, num_features)
+                _, encoded = sae(h_cast.unsqueeze(0))  # (1, num_features)
                 feature_activations[layer_idx] = encoded.squeeze(0)  # (num_features,)
         return feature_activations
 

@@ -54,14 +54,22 @@ def _find_free_port() -> int:
 
 
 def _wait_for_health(port: int, timeout: int = 180) -> bool:
-    """Poll the worker's /health endpoint until it responds."""
+    """Poll the worker's /health endpoint until the model is actually loaded.
+
+    The worker's HTTP server starts before weights are loaded, so a bare
+    200-check returns too early.  We verify ``model_loaded: true`` in the
+    JSON body to ensure the worker can actually serve inference.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
             req = Request(f"http://127.0.0.1:{port}/health")
             with urlopen(req, timeout=2) as resp:
                 if resp.status == 200:
-                    return True
+                    body = json.loads(resp.read().decode())
+                    if body.get("model_loaded"):
+                        return True
+                    # HTTP server up but model still loading — keep polling
         except Exception:
             pass
         time.sleep(0.5)

@@ -1891,6 +1891,20 @@ class EngineHandler(BaseHTTPRequestHandler):
             ok = _engine.prefix_cache.load_state(load_path)
             self._json({"ok": ok, "path": load_path,
                          "prefix_tokens": _engine.prefix_cache._cached_len if ok else 0})
+        elif self.path == "/cache/export_context":
+            # Export raw segment text for cross-backend handoff (Neural Handoff).
+            # Returns segment text that can be replayed into a different backend
+            # (e.g., llama-server GGUF) to warm its KV cache from scratch.
+            pc = _engine.prefix_cache
+            segments = dict(pc.segments)
+            prefix = "\n\n".join(v for v in segments.values() if v)
+            self._json({
+                "ok": True,
+                "segments": segments,
+                "prefix_text": prefix,
+                "prefix_tokens": pc._cached_len,
+                "segment_count": len(segments),
+            })
         elif self.path == "/thought/hold":
             b = self._body()
             pc = _engine.prefix_cache

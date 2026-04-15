@@ -361,6 +361,23 @@ class ChatFormatter:
         """Return the EOS token ID (never hardcoded)."""
         return self.tokenizer.eos_token_id
 
+    @property
+    def stop_token_ids(self) -> set:
+        """Return all token IDs that should stop generation.
+
+        For Gemma 4, the end-of-turn token (<turn|>) signals the model
+        has finished its response. Without this, the model continues
+        generating hallucinated multi-turn conversations.
+        """
+        ids = {self.tokenizer.eos_token_id}
+        if self.family == "gemma4":
+            eot = getattr(self.tokenizer, 'eot_token', None)
+            if eot:
+                eot_id = self.tokenizer.convert_tokens_to_ids(eot)
+                if eot_id is not None and eot_id != self.tokenizer.unk_token_id:
+                    ids.add(eot_id)
+        return ids
+
 
 # ── KV Prefix Cache ──────────────────────────────────────────────────────────
 
@@ -1294,13 +1311,16 @@ class GAIAEngine:
             del out  # Free full output immediately
 
             # Autoregressive loop — minimal overhead, with entropy tracking
-            eos_id = self.formatter.eos_token_id
+            _stop_ids = self.formatter.stop_token_ids
             # Suppress think token — model defaults to thinking mode.
             # We mask it in logits so the model generates the answer directly.
             # Token ID varies by model family — resolve dynamically via formatter
             _think_token_id = self.tokenizer.convert_tokens_to_ids(self.formatter.think_token)
             if _think_token_id is None or _think_token_id == self.tokenizer.unk_token_id:
                 _think_token_id = -1  # Not in vocab — skip suppression
+            _eos_only = {self.formatter.eos_token_id}  # always stop immediately
+            _soft_stop = _stop_ids - _eos_only  # stop after min tokens (e.g. <turn|>)
+            _MIN_TOKENS_BEFORE_SOFT_STOP = 3
             _entropy_sum = 0.0
             _entropy_count = 0
             for step in range(max_tokens):
@@ -1336,7 +1356,9 @@ class GAIAEngine:
                     next_id = logits.argmax(dim=-1, keepdim=True)
 
                 token = next_id.item()
-                if token == eos_id:
+                if token in _eos_only:
+                    break
+                if token in _soft_stop and step >= _MIN_TOKENS_BEFORE_SOFT_STOP:
                     break
                 generated.append(token)
 
@@ -1364,6 +1386,32 @@ class GAIAEngine:
                 text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
                 text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL)
                 text = text.strip()
+
+            # Strip hallucinated tool calls — model may emit <tool_call>{...}
+            # even when no tools were requested. Extract text before the first
+            # tool_call block. Also strip <blockquote> wrappers.
+            if "<tool_call>" in text:
+                pre_tool = text.split("<tool_call>")[0].strip()
+                if pre_tool:
+                    text = pre_tool
+                else:
+                    # Entire response is tool calls — extract any natural language
+                    text = re.sub(r'<tool_call>.*?(?:</tool_call>|\})\s*', '', text, flags=re.DOTALL).strip()
+            if text.startswith("<blockquote>"):
+                text = re.sub(r'<blockquote>.*?</blockquote>\s*', '', text, flags=re.DOTALL).strip()
+                if not text:
+                    # blockquote contained the question echo — extract after it
+                    text = re.sub(r'^<blockquote>[^<]*', '', text).strip()
+
+            # Strip hallucinated multi-turn continuations.
+            # The model sometimes generates "user\n..." after its response.
+            if text:
+                _turn_markers = re.search(
+                    r'\n(?:user(?:_\w+)?|assistant|system)(?:\s*[:|\n])',
+                    text, re.IGNORECASE,
+                )
+                if _turn_markers:
+                    text = text[:_turn_markers.start()].rstrip()
 
             self._request_count += 1
             self._total_tokens += len(generated)
@@ -1448,7 +1496,10 @@ class GAIAEngine:
             prompt = self.formatter.format_conversation(all_msgs, enable_thinking=True)
 
             input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.model.device)
-            eos_id = self.formatter.eos_token_id
+            _stop_ids = self.formatter.stop_token_ids
+            _eos_only = {self.formatter.eos_token_id}
+            _soft_stop = _stop_ids - _eos_only
+            _MIN_TOKENS_BEFORE_SOFT_STOP = 3
 
             # Suppress think token (model-family-aware)
             _think_token_id = -1
@@ -1506,7 +1557,9 @@ class GAIAEngine:
                     next_id = logits.argmax(dim=-1, keepdim=True)
 
                 token = next_id.item()
-                if token == eos_id:
+                if token in _eos_only:
+                    break
+                if token in _soft_stop and step >= _MIN_TOKENS_BEFORE_SOFT_STOP:
                     break
                 generated.append(token)
 

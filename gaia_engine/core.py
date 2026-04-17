@@ -446,11 +446,25 @@ class PrefixCache:
             import threading
             import torch as _save_torch
 
+            logger.info("KV prefix auto-save: snapshotting %d layers to CPU...", len(self._cached_kv))
             # Snapshot the KV tensors NOW (before they can be invalidated)
-            _kv_snap = tuple(
-                tuple(t.detach().cpu().float() for t in layer_kv)
-                for layer_kv in self._cached_kv
-            )
+            try:
+                _kv_snap = []
+                for layer_kv in self._cached_kv:
+                    if layer_kv is None:
+                        _kv_snap.append(None)
+                    else:
+                        _kv_snap.append(tuple(
+                            t.detach().cpu().float() if t is not None else None
+                            for t in layer_kv
+                        ))
+                _kv_snap = tuple(_kv_snap)
+                _non_none = sum(1 for l in _kv_snap if l is not None)
+                logger.info("KV prefix snapshot: %d layers (%d with data)",
+                           len(_kv_snap), _non_none)
+            except Exception as _snap_err:
+                logger.warning("KV prefix snapshot FAILED: %s", _snap_err)
+                return self._cached_kv, self._cached_len
             _save_state = {
                 "kv_cache": _kv_snap,
                 "prefix_len": self._cached_len,
@@ -493,12 +507,16 @@ class PrefixCache:
         save_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Convert KV tuples to CPU float32 tensors for portability
+        # Gemma 4 may have None entries for layers without KV cache
         kv_cpu = []
         for layer_kv in self._cached_kv:
-            layer_tensors = []
-            for t in layer_kv:
-                layer_tensors.append(t.detach().cpu().float())
-            kv_cpu.append(tuple(layer_tensors))
+            if layer_kv is None:
+                kv_cpu.append(None)
+            else:
+                layer_tensors = []
+                for t in layer_kv:
+                    layer_tensors.append(t.detach().cpu().float() if t is not None else None)
+                kv_cpu.append(tuple(layer_tensors))
 
         state = {
             "kv_cache": kv_cpu,
@@ -535,13 +553,19 @@ class PrefixCache:
         except Exception:
             pass
 
-        # Cast KV tensors to target device and dtype
+        # Cast KV tensors to target device and dtype (handle None layers)
         kv_restored = []
         for layer_kv in state["kv_cache"]:
-            layer_tensors = []
-            for t in layer_kv:
-                layer_tensors.append(t.to(device=self.device, dtype=target_dtype))
-            kv_restored.append(tuple(layer_tensors))
+            if layer_kv is None:
+                kv_restored.append(None)
+            else:
+                layer_tensors = []
+                for t in layer_kv:
+                    if t is not None:
+                        layer_tensors.append(t.to(device=self.device, dtype=target_dtype))
+                    else:
+                        layer_tensors.append(None)
+                kv_restored.append(tuple(layer_tensors))
 
         self._cached_kv = tuple(kv_restored)
         self._cached_len = state["prefix_len"]

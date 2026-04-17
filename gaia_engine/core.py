@@ -437,55 +437,41 @@ class PrefixCache:
         logger.info("KV prefix recomputed (%d tokens, segments: %s)",
                      self._cached_len, list(self._hashes.keys()))
 
-        # Auto-save KV prefix to disk from WITHIN the worker process.
-        # The HTTP /cache/save endpoint times out (131MB tensor write > proxy timeout).
-        # So we save directly here, in a background thread to avoid blocking inference.
-        _persist_path = self._PERSISTENT_CACHE_PATH
-        if not hasattr(self, '_persistent_save_done') or not self._persistent_save_done:
-            self._persistent_save_done = True
-            import threading
-            import torch as _save_torch
-
-            logger.info("KV prefix auto-save: snapshotting %d layers to CPU...", len(self._cached_kv))
-            # Snapshot the KV tensors NOW (before they can be invalidated)
-            try:
-                _kv_snap = []
-                for layer_kv in self._cached_kv:
-                    if layer_kv is None:
-                        _kv_snap.append(None)
-                    else:
-                        _kv_snap.append(tuple(
-                            t.detach().cpu().float() if t is not None else None
-                            for t in layer_kv
-                        ))
-                _kv_snap = tuple(_kv_snap)
-                _non_none = sum(1 for l in _kv_snap if l is not None)
-                logger.info("KV prefix snapshot: %d layers (%d with data)",
-                           len(_kv_snap), _non_none)
-            except Exception as _snap_err:
-                logger.warning("KV prefix snapshot FAILED: %s", _snap_err)
-                return self._cached_kv, self._cached_len
-            _save_state = {
-                "kv_cache": _kv_snap,
-                "prefix_len": self._cached_len,
-                "segments": dict(self.segments),
-                "hashes": dict(self._hashes),
-                "device_saved_from": str(self.device),
-            }
-
-            def _write():
-                try:
-                    Path(_persist_path).parent.mkdir(parents=True, exist_ok=True)
-                    _save_torch.save(_save_state, _persist_path)
-                    _sz = Path(_persist_path).stat().st_size / 1024 / 1024
-                    logger.info("KV prefix auto-saved: %s (%.1f MB, %d tokens)",
-                               _persist_path, _sz, _save_state["prefix_len"])
-                except Exception as _e:
-                    logger.warning("KV prefix auto-save failed: %s", _e)
-
-            threading.Thread(target=_write, daemon=True, name="kv-prefix-save").start()
+        # Mark prefix as dirty — actual save happens during controlled events
+        # (model unload, shutdown, park) via save_persistent_prefix().
+        # No background threads, no races.
+        self._persistent_prefix_dirty = True
 
         return self._cached_kv, self._cached_len
+
+    def save_persistent_prefix(self) -> bool:
+        """Save KV prefix to disk during a controlled event (unload, shutdown, park).
+
+        Called synchronously when inference is stopped and no races are possible.
+        The engine manager calls this BEFORE killing the worker subprocess.
+
+        Returns True if saved successfully.
+        """
+        if not getattr(self, '_persistent_prefix_dirty', False):
+            logger.debug("save_persistent_prefix: not dirty, skipping")
+            return False
+        if self._cached_kv is None:
+            logger.debug("save_persistent_prefix: no KV tensors cached")
+            return False
+
+        path = self._PERSISTENT_CACHE_PATH
+        logger.info("Saving persistent KV prefix (%d tokens) to %s...",
+                     self._cached_len, path)
+        try:
+            ok = self.save_state(path)
+            if ok:
+                self._persistent_prefix_dirty = False
+                _sz = Path(path).stat().st_size / 1024 / 1024
+                logger.info("Persistent KV prefix saved: %.1f MB", _sz)
+            return ok
+        except Exception as e:
+            logger.warning("Persistent KV prefix save failed: %s", e)
+            return False
 
     def invalidate(self):
         self._cached_kv = None
@@ -2033,6 +2019,17 @@ class EngineHandler(BaseHTTPRequestHandler):
                 "prefix_text": prefix,
                 "prefix_tokens": pc._cached_len,
                 "segment_count": len(segments),
+            })
+        elif self.path == "/cache/persist":
+            # Synchronous save of KV prefix to disk — called by engine manager
+            # BEFORE killing the worker subprocess. No races, no background threads.
+            # This is the controlled save point.
+            pc = _engine.prefix_cache
+            ok = pc.save_persistent_prefix()
+            self._json({
+                "ok": ok,
+                "prefix_tokens": pc._cached_len,
+                "dirty": getattr(pc, '_persistent_prefix_dirty', False),
             })
         elif self.path == "/thought/hold":
             b = self._body()

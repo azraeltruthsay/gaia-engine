@@ -240,6 +240,27 @@ class EngineManager:
             import traceback
             caller = "".join(traceback.format_stack()[-4:-1]).strip()
             logger.warning("Worker stop requested for %s — caller:\n%s", old_model, caller)
+
+            # ── Controlled KV prefix save BEFORE kill ──
+            # The worker has the KV tensors in memory. Save them to disk
+            # now, while inference is stopped, for instant restoration next boot.
+            if self.worker_port is not None:
+                try:
+                    from urllib.request import Request, urlopen
+                    req = Request(
+                        f"http://127.0.0.1:{self.worker_port}/cache/persist",
+                        data=b'{}',
+                        headers={"Content-Type": "application/json"},
+                    )
+                    with urlopen(req, timeout=30) as resp:
+                        result = json.loads(resp.read())
+                        if result.get("ok"):
+                            logger.info("KV prefix persisted before unload: %s", result)
+                        else:
+                            logger.debug("KV prefix persist skipped: %s", result)
+                except Exception as e:
+                    logger.debug("KV prefix persist before unload failed: %s", e)
+
             self._kill_worker_process()
             logger.info("Worker killed — model %s unloaded, GPU memory freed", old_model)
 

@@ -384,6 +384,11 @@ class ChatFormatter:
 class PrefixCache:
     """Segmented KV prefix cache with hash-based invalidation."""
 
+    # Path for persistent KV prefix cache — survives restarts, gear shifts, sleep
+    _PERSISTENT_CACHE_PATH = os.environ.get(
+        "GAIA_KV_PREFIX_PATH", "/shared/kvcache/core/identity_prefix.pt"
+    )
+
     def __init__(self, model, tokenizer, device: str = "cuda",
                  formatter: Optional[ChatFormatter] = None):
         self.model = model
@@ -431,6 +436,41 @@ class PrefixCache:
 
         logger.info("KV prefix recomputed (%d tokens, segments: %s)",
                      self._cached_len, list(self._hashes.keys()))
+
+        # Auto-save KV prefix to disk from WITHIN the worker process.
+        # The HTTP /cache/save endpoint times out (131MB tensor write > proxy timeout).
+        # So we save directly here, in a background thread to avoid blocking inference.
+        _persist_path = self._PERSISTENT_CACHE_PATH
+        if not hasattr(self, '_persistent_save_done') or not self._persistent_save_done:
+            self._persistent_save_done = True
+            import threading
+            import torch as _save_torch
+
+            # Snapshot the KV tensors NOW (before they can be invalidated)
+            _kv_snap = tuple(
+                tuple(t.detach().cpu().float() for t in layer_kv)
+                for layer_kv in self._cached_kv
+            )
+            _save_state = {
+                "kv_cache": _kv_snap,
+                "prefix_len": self._cached_len,
+                "segments": dict(self.segments),
+                "hashes": dict(self._hashes),
+                "device_saved_from": str(self.device),
+            }
+
+            def _write():
+                try:
+                    Path(_persist_path).parent.mkdir(parents=True, exist_ok=True)
+                    _save_torch.save(_save_state, _persist_path)
+                    _sz = Path(_persist_path).stat().st_size / 1024 / 1024
+                    logger.info("KV prefix auto-saved: %s (%.1f MB, %d tokens)",
+                               _persist_path, _sz, _save_state["prefix_len"])
+                except Exception as _e:
+                    logger.warning("KV prefix auto-save failed: %s", _e)
+
+            threading.Thread(target=_write, daemon=True, name="kv-prefix-save").start()
+
         return self._cached_kv, self._cached_len
 
     def invalidate(self):
@@ -779,6 +819,18 @@ class GAIAEngine:
                     logger.info("Behavioral cache loaded: %d examples from %s", len(_examples), _behavioral_path)
         except Exception as _bc_exc:
             logger.debug("Behavioral cache not loaded: %s", _bc_exc)
+
+        # ── Persistent KV Prefix: load from disk if available ──
+        # Avoids reprocessing the system prompt on every restart.
+        # The first request computes the prefix and auto-saves it.
+        # Subsequent boots load the saved tensors (~50ms vs ~1s recompute).
+        try:
+            if self.prefix_cache.load_state(PrefixCache._PERSISTENT_CACHE_PATH):
+                logger.info("KV prefix restored from disk — skipping system prompt recompute")
+            else:
+                logger.info("No persistent KV prefix found — will compute on first request and save")
+        except Exception as _kv_load_exc:
+            logger.debug("Persistent KV prefix load failed: %s", _kv_load_exc)
 
         self.monitor = ActivationMonitor()
         self.thoughts = ThoughtManager()

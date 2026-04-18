@@ -57,8 +57,14 @@ def _wait_for_health(port: int, timeout: int = 180) -> bool:
     """Poll the worker's /health endpoint until the model is actually loaded.
 
     The worker's HTTP server starts before weights are loaded, so a bare
-    200-check returns too early.  We verify ``model_loaded: true`` in the
-    JSON body to ensure the worker can actually serve inference.
+    200-check returns too early.  We check two response formats:
+
+    - GAIA Engine (Python): ``{"model_loaded": true, ...}``
+    - llama-server (GGUF):  ``{"status": "ok"}``
+
+    llama-server doesn't expose a ``model_loaded`` field — it returns
+    ``{"status": "ok"}`` only after weights are loaded and slots are
+    initialized, so ``status == "ok"`` is sufficient for GGUF workers.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -67,7 +73,11 @@ def _wait_for_health(port: int, timeout: int = 180) -> bool:
             with urlopen(req, timeout=2) as resp:
                 if resp.status == 200:
                     body = json.loads(resp.read().decode())
+                    # GAIA Engine Python worker: explicit model_loaded field
                     if body.get("model_loaded"):
+                        return True
+                    # llama-server (GGUF): status=ok means ready to serve
+                    if body.get("status") == "ok" and "model_loaded" not in body:
                         return True
                     # HTTP server up but model still loading — keep polling
         except Exception:

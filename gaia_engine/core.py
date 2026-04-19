@@ -723,14 +723,16 @@ class GAIAEngine:
                     bnb_4bit_quant_type="nf4",
                     bnb_4bit_use_double_quant=True,
                 )
-                # NF4 direct to GPU — quantization happens during loading
+                # NF4 direct to GPU — quantization happens during loading.
+                # Use "eager" attention for Gemma 4 — "sdpa" triggers
+                # normal_kernel_cuda errors with Gemma4ClippableLinear layers.
                 logger.info("Loading NF4 directly to GPU...")
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_path, trust_remote_code=True,
                     quantization_config=nf4_config,
                     device_map="auto",
                     low_cpu_mem_usage=True,
-                    attn_implementation="sdpa",
+                    attn_implementation="eager",
                 )
                 torch.cuda.empty_cache()
                 quant_mb = torch.cuda.memory_allocated() / (1024**2)

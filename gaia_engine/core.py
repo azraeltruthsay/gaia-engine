@@ -887,6 +887,9 @@ class GAIAEngine:
 
         The first adapter loaded wraps the base model with PeftModel.
         Subsequent adapters are added to the same PeftModel.
+
+        For Gemma 4 models: unwraps Gemma4ClippableLinear → Linear4bit
+        before PEFT wraps it, since PEFT doesn't recognize Clippable.
         """
         try:
             from peft import PeftModel
@@ -895,6 +898,28 @@ class GAIAEngine:
 
         with self._lock:
             try:
+                # Unwrap Gemma4ClippableLinear layers (PEFT can't target them)
+                _unwrap_count = 0
+                for _name, module in self._base_model.named_modules():
+                    for attr_name in list(vars(module).keys()):
+                        child = getattr(module, attr_name, None)
+                        if child is not None and type(child).__name__ == "Gemma4ClippableLinear":
+                            inner = getattr(child, "linear", None)
+                            if inner is not None:
+                                setattr(module, attr_name, inner)
+                                _unwrap_count += 1
+                    children_to_replace = {}
+                    for child_name, child in module._modules.items():
+                        if type(child).__name__ == "Gemma4ClippableLinear":
+                            inner = getattr(child, "linear", None)
+                            if inner is not None:
+                                children_to_replace[child_name] = inner
+                    for child_name, inner in children_to_replace.items():
+                        module._modules[child_name] = inner
+                        _unwrap_count += 1
+                if _unwrap_count > 0:
+                    logger.info("Unwrapped %d Gemma4ClippableLinear → Linear4bit for PEFT compat", _unwrap_count)
+
                 if self._peft_model is None:
                     # First adapter — wrap base model
                     logger.info("Loading first adapter '%s' from %s", name, path)

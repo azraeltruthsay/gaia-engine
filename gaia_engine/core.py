@@ -1235,7 +1235,11 @@ class GAIAEngine:
                 # Decode only generated tokens
                 generated_ids = output_ids[0][input_ids.shape[1]:]
                 text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-                if "<think>" in text:
+                # Preserve <think>...</think> when an adapter is active —
+                # adapter-driven deliberation depends on the thinking trace
+                # being visible to downstream parsers. For base-model
+                # inference, strip as before to keep responses tidy.
+                if "<think>" in text and self._active_adapter is None:
                     text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
 
                 self._request_count += 1
@@ -1471,7 +1475,10 @@ class GAIAEngine:
 
             # Decode
             text = self.tokenizer.decode(generated, skip_special_tokens=True)
-            if "<think>" in text:
+            # Preserve <think>...</think> when an adapter is active so
+            # adapter-driven deliberation traces reach the caller's parser
+            # intact. Strip for base-model inference to keep responses tidy.
+            if "<think>" in text and self._active_adapter is None:
                 text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
                 text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL)
                 text = text.strip()

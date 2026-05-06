@@ -512,6 +512,30 @@ class EngineManager:
             model_loaded = worker_alive and self.worker_port is not None
 
         if model_loaded:
+            # When inference is in flight, skip the proxy. The worker uses a
+            # single-threaded HTTPServer, so /health would queue behind
+            # /v1/chat/completions. For long requests (vision inference can
+            # run 60s+) this caused doctor health checks to time out at
+            # 5s × 4 retries, triggering spurious gaia-core restarts mid-
+            # battery. Manager-level state is sufficient for liveness.
+            if self._active_inference_count > 0:
+                with self._lock:
+                    worker_pid = self.worker_process.pid if self.worker_process else None
+                return {
+                    "status": "ok",
+                    "engine": "gaia-managed",
+                    "backend": self.backend or "engine",
+                    "model_loaded": True,
+                    "mode": "active",
+                    "managed": True,
+                    "device": self.device or "unknown",
+                    "model_path": self.model_path or "",
+                    "worker_pid": worker_pid,
+                    "draining": self._draining,
+                    "active_inference": self._active_inference_count,
+                    "health_source": "manager",
+                }
+
             # Forward to worker for detailed health
             status, _, body = self.proxy_to_worker("GET", "/health", {})
             if status == 200:

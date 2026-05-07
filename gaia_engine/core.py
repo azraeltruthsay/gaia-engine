@@ -717,16 +717,26 @@ class GAIAEngine:
             try:
                 import bitsandbytes as bnb
                 from transformers import BitsAndBytesConfig
+                # For multimodal Gemma 4: skip NF4 on vision/audio towers.
+                # They use Gemma4ClippableLinear (native QAT) and double-
+                # quantizing through bnb produces an NF4/QAT shape mismatch
+                # in the forward pass (q_proj.weight.shape[1] != 1 assert).
+                # Towers stay in bf16 — ~3GB extra VRAM — but LM still gets
+                # the full NF4 footprint reduction.
+                skip_modules = ["lm_head"]
+                if self.has_vision:
+                    skip_modules.extend(["vision_tower", "audio_tower", "embed_vision", "embed_audio"])
                 nf4_config = BitsAndBytesConfig(
                     load_in_4bit=True,
                     bnb_4bit_compute_dtype=torch.bfloat16,
                     bnb_4bit_quant_type="nf4",
                     bnb_4bit_use_double_quant=True,
+                    llm_int8_skip_modules=skip_modules,
                 )
                 # NF4 direct to GPU — quantization happens during loading.
                 # Use "eager" attention for Gemma 4 — "sdpa" triggers
                 # normal_kernel_cuda errors with Gemma4ClippableLinear layers.
-                logger.info("Loading NF4 directly to GPU...")
+                logger.info("Loading NF4 directly to GPU (skip=%s)...", skip_modules)
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_path, trust_remote_code=True,
                     quantization_config=nf4_config,
@@ -783,6 +793,58 @@ class GAIAEngine:
                     torch.cuda.empty_cache()
                     _freed_mb = torch.cuda.memory_allocated() / (1024**2)
                     logger.info("Vision tower detached (VRAM now: %.0fMB)", _freed_mb)
+
+        # Audio tower dequant: BitsAndBytesConfig.llm_int8_skip_modules
+        # contract should keep audio_tower in bf16, but in practice the
+        # substring matcher fails on the nested Gemma4ClippableLinear's
+        # `.linear` submodules so they get quantized to NF4 / Params4bit
+        # / uint8. The audio encoder layers
+        # (Gemma4AudioFeedForward / Gemma4AudioLightConv1d / Gemma4AudioLayer)
+        # all read `weight.dtype` via torch.finfo() in their forward, which
+        # raises TypeError on uint8. Dequantize in-place to bf16 nn.Linear
+        # so audio inference works. No-op if model was loaded in bf16.
+        if use_nf4 and hasattr(self.model, "model") and \
+                hasattr(self.model.model, "audio_tower") and \
+                self.model.model.audio_tower is not None:
+            try:
+                import bitsandbytes as _bnb
+                import bitsandbytes.functional as _bnb_f
+                import torch.nn as _nn
+
+                to_replace = []
+                for name, mod in self.model.named_modules():
+                    if "audio_tower" not in name:
+                        continue
+                    for an, ch in list(mod.named_children()):
+                        if isinstance(ch, _bnb.nn.Linear4bit):
+                            to_replace.append((mod, an, ch))
+
+                if to_replace:
+                    logger.info("Audio tower NF4 dequant: %d Linear4bit modules → bf16 (workaround for skip_modules)", len(to_replace))
+                    for parent, an, lin4 in to_replace:
+                        weight_gpu = lin4.weight.data
+                        qstate = lin4.weight.quant_state
+                        if weight_gpu.device.type != "cuda":
+                            weight_gpu = weight_gpu.cuda()
+                        dequant_gpu = _bnb_f.dequantize_4bit(weight_gpu, qstate)
+                        new_linear = _nn.Linear(
+                            lin4.in_features, lin4.out_features,
+                            bias=lin4.bias is not None,
+                            dtype=torch.bfloat16, device="cuda",
+                        )
+                        with torch.no_grad():
+                            new_linear.weight.copy_(dequant_gpu.to(torch.bfloat16))
+                            if lin4.bias is not None:
+                                new_linear.bias.copy_(lin4.bias.detach().to(torch.bfloat16))
+                        setattr(parent, an, new_linear)
+                        del lin4, dequant_gpu
+                    gc.collect()
+                    if device == "cuda":
+                        torch.cuda.empty_cache()
+                    _vram_mb = torch.cuda.memory_allocated() / (1024**2) if device == "cuda" else 0
+                    logger.info("Audio tower dequant complete (VRAM now: %.0fMB)", _vram_mb)
+            except Exception as _audio_dq_err:
+                logger.warning("Audio tower dequant failed (audio inference may break): %s", _audio_dq_err)
 
         # Compile for speed — disable CUDA graphs to avoid conflicts
         # with dynamic KV cache sizes in autoregressive generation
@@ -1094,6 +1156,143 @@ class GAIAEngine:
                         return True
         return False
 
+    def _has_audio_content(self, messages: list) -> bool:
+        """Check if any message contains audio content (OpenAI multimodal format).
+
+        Supports two content types: 'audio' with raw bytes/array (rare),
+        and 'audio_url' with data URI (data:audio/wav;base64,...) or a
+        file path (/shared/... or file:///...). Mirrors _has_vision_content.
+        """
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") in ("audio", "audio_url", "input_audio"):
+                        return True
+        return False
+
+    def _prepare_audio_inputs(self, messages: list) -> dict:
+        """Process multimodal messages with audio through the Gemma 4 audio
+        processor. Returns dict with input_ids, attention_mask, plus the
+        audio-specific tensors (input_features, input_features_mask) ready
+        for model.generate().
+
+        Two content forms supported, mirroring _prepare_vision_inputs:
+          - {"type": "audio", "audio": <np.ndarray>} — raw float32 16kHz mono
+          - {"type": "audio_url", "audio_url": {"url": "data:audio/...;base64,..." | "/path"}}
+        """
+        import io as _io
+        import wave as _wave
+        import base64 as _b64
+        import numpy as _np
+
+        audio_tok = getattr(self.processor, "audio_token", None) or "<|audio|>"
+
+        audios: list = []
+        text_parts: list[str] = []
+
+        def _decode_b64_or_path(url: str) -> _np.ndarray:
+            if url.startswith("data:"):
+                # data:audio/wav;base64,...
+                _, b64 = url.split(",", 1)
+                raw = _b64.b64decode(b64)
+                # Try wave first (PCM WAV); fallback to scipy if available.
+                try:
+                    with _wave.open(_io.BytesIO(raw), "rb") as w:
+                        n_ch = w.getnchannels()
+                        sw = w.getsampwidth()
+                        fr = w.getframerate()
+                        nf = w.getnframes()
+                        b = w.readframes(nf)
+                except _wave.Error:
+                    raise ValueError("audio_url base64 not a PCM WAV (other codecs need ffmpeg)")
+            elif url.startswith("/") or url.startswith("file://"):
+                path = url.replace("file://", "")
+                with _wave.open(path, "rb") as w:
+                    n_ch = w.getnchannels()
+                    sw = w.getsampwidth()
+                    fr = w.getframerate()
+                    nf = w.getnframes()
+                    b = w.readframes(nf)
+            else:
+                raise ValueError(f"Unsupported audio_url scheme: {url[:50]}")
+
+            if sw == 2:
+                data = _np.frombuffer(b, dtype="<i2").astype(_np.float32) / 32768.0
+            elif sw == 4:
+                data = _np.frombuffer(b, dtype="<i4").astype(_np.float32) / 2147483648.0
+            else:
+                data = (_np.frombuffer(b, dtype="u1").astype(_np.float32) - 128.0) / 128.0
+            if n_ch > 1:
+                data = data.reshape(-1, n_ch).mean(axis=1)
+            if fr != 16000:
+                # Linear resample (synthetic-grade; real audio should pre-resample)
+                ratio = 16000 / fr
+                new_len = int(round(len(data) * ratio))
+                if new_len > 1:
+                    xp = _np.linspace(0, 1, len(data), endpoint=False)
+                    x_new = _np.linspace(0, 1, new_len, endpoint=False)
+                    data = _np.interp(x_new, xp, data).astype(_np.float32)
+            return data
+
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content")
+            if isinstance(content, str):
+                content_text = content
+            elif isinstance(content, list):
+                buf: list[str] = []
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    ptype = part.get("type", "")
+                    if ptype == "text":
+                        buf.append(part.get("text", ""))
+                    elif ptype == "audio_url":
+                        url = part.get("audio_url", {})
+                        if isinstance(url, dict):
+                            url = url.get("url", "")
+                        try:
+                            wav = _decode_b64_or_path(url)
+                            audios.append(wav)
+                            buf.append(audio_tok)
+                        except Exception as e:
+                            logger.warning("audio_url decode failed: %s", e)
+                            buf.append(f"[audio decode failed: {e}]")
+                    elif ptype == "audio" and "audio" in part:
+                        a = part["audio"]
+                        if isinstance(a, _np.ndarray):
+                            audios.append(a.astype(_np.float32))
+                            buf.append(audio_tok)
+                        else:
+                            logger.warning("Unsupported 'audio' payload type: %s", type(a).__name__)
+                content_text = "".join(buf).strip()
+            else:
+                content_text = str(content) if content is not None else ""
+
+            text_parts.append(self.formatter.format_message(role, content_text))
+
+        if not audios:
+            raise ValueError("_prepare_audio_inputs called but no audio found in messages")
+
+        text_parts.append(self.formatter.assistant_prefix(enable_thinking=True))
+        text_input = "\n".join(text_parts)
+
+        # Note: NO truncation — Gemma4Processor truncates input_features
+        # incorrectly when truncation=True (clips to ~6 frames even when
+        # input_ids is well below max_length). Audio prompts are short.
+        inputs = self.processor(
+            text=[text_input],
+            audio=audios,
+            return_tensors="pt",
+            padding=True,
+            sampling_rate=16000,
+        )
+
+        device = self.model.device
+        inputs = {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
+        return inputs
+
     def _prepare_vision_inputs(self, messages: list) -> dict:
         """Process multimodal messages through the VL processor.
 
@@ -1101,43 +1300,65 @@ class GAIAEngine:
             [{"type": "text", "text": "..."}, {"type": "image", "image": <PIL>}]
         Also handles image_url with base64 data URIs or file paths.
 
+        Uses the engine's ChatFormatter (not processor.apply_chat_template)
+        because Gemma 4's tokenizer/processor ship without a chat template
+        for multimodal content. We build the prompt text manually with role
+        turn tags plus <|image>…<|image|>…<image|> placeholder blocks, then
+        pass text + images to the processor which expands the placeholder
+        token into N image soft tokens and emits pixel_values.
+
         Returns a dict of tensors ready for model.generate() or model().
         """
         import base64 as _b64
         import io as _io
         from PIL import Image
 
-        # Extract images and rebuild messages for the processor
-        images = []
-        processed_messages = []
+        # Inline image placeholder. Gemma 4's processor expands a bare
+        # "<|image|>" token (id 258880) into num_image_soft_tokens (256 on
+        # E4B) AND auto-wraps it with boi/eoi at call time. Writing our own
+        # "<|image>…<|image|>…<image|>" wrappers produces DOUBLE boi/eoi,
+        # which neither the trained LM nor the base model has ever seen —
+        # makes vision output garbage. Keep this bare.
+        img_tok = getattr(self.processor, "image_token", None) or "<|image|>"
+        image_block = img_tok
+
+        # Walk every message, extract images in order, and build the flat
+        # text version of that message's content. Images are kept in a
+        # parallel list for the processor; in the text we emit an image
+        # block at each image's position so spatial alignment is preserved
+        # when two or more images are interleaved with text.
+        images: list = []
+        text_parts: list[str] = []
 
         for msg in messages:
+            role = msg.get("role", "user")
             content = msg.get("content")
+
             if isinstance(content, str):
-                # Plain text message — pass through
-                processed_messages.append(msg)
+                content_text = content
             elif isinstance(content, list):
-                # Multimodal message — extract images, rebuild content
-                new_content = []
+                buf: list[str] = []
                 for part in content:
                     if not isinstance(part, dict):
                         continue
                     ptype = part.get("type", "")
-                    if ptype == "image" and "image" in part:
-                        # Direct PIL image
+                    if ptype == "text":
+                        buf.append(part.get("text", ""))
+                    elif ptype == "image" and "image" in part:
                         img = part["image"]
                         if not isinstance(img, Image.Image):
                             img = Image.open(img).convert("RGB")
+                        else:
+                            img = img.convert("RGB") if img.mode != "RGB" else img
                         images.append(img)
-                        new_content.append({"type": "image", "image": img})
+                        buf.append(image_block)
                     elif ptype == "image_url":
-                        # Base64 data URI or file path
                         url = part.get("image_url", {})
                         if isinstance(url, dict):
                             url = url.get("url", "")
+                        img = None
                         if url.startswith("data:image"):
-                            # data:image/jpeg;base64,/9j/4AAQ...
-                            header, b64data = url.split(",", 1)
+                            _, b64data = url.split(",", 1)
                             img = Image.open(_io.BytesIO(_b64.b64decode(b64data))).convert("RGB")
                         elif url.startswith("/") or url.startswith("file://"):
                             path = url.replace("file://", "")
@@ -1146,33 +1367,31 @@ class GAIAEngine:
                             logger.warning("Unsupported image_url scheme: %s", url[:50])
                             continue
                         images.append(img)
-                        new_content.append({"type": "image", "image": img})
-                    elif ptype == "text":
-                        new_content.append({"type": "text", "text": part.get("text", "")})
-                    else:
-                        new_content.append(part)
-                processed_messages.append({"role": msg["role"], "content": new_content})
+                        buf.append(image_block)
+                content_text = "".join(buf).strip()
             else:
-                processed_messages.append(msg)
+                content_text = str(content) if content is not None else ""
+
+            text_parts.append(self.formatter.format_message(role, content_text))
 
         if not images:
             raise ValueError("_prepare_vision_inputs called but no images found in messages")
 
-        # Apply chat template through the processor
-        text_input = self.processor.apply_chat_template(
-            processed_messages, tokenize=False, add_generation_prompt=True,
-        )
+        # Append the assistant generation prompt so the model knows where to
+        # start emitting its reply. enable_thinking=True matches the default
+        # text path.
+        text_parts.append(self.formatter.assistant_prefix(enable_thinking=True))
+        text_input = "\n".join(text_parts)
+
         inputs = self.processor(
             text=[text_input],
-            images=images if images else None,
+            images=images,
             return_tensors="pt",
             padding=True,
         )
 
-        # Move all tensors to model device
         device = self.model.device
         inputs = {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
-
         return inputs
 
     def generate(self, messages: list, max_tokens: int = 512,
@@ -1209,6 +1428,52 @@ class GAIAEngine:
                 local_str = ""
                 local_simple = utc_str
                 date_str = ""
+
+            # ── AUDIO MODE: audio input via processor ──────────────────
+            # (Checked before vision because a turn could carry both;
+            # audio path also handles the text-only fields the same way.)
+            if self._has_audio_content(messages):
+                logger.info("Audio content detected — using multimodal processor path")
+                audio_inputs = self._prepare_audio_inputs(messages)
+                input_ids = audio_inputs.pop("input_ids")
+                total_input = input_ids.shape[1]
+                past_kv = None
+                prefix_len = 0
+
+                with torch.no_grad():
+                    output_ids = self.model.generate(
+                        input_ids=input_ids,
+                        **{k: v for k, v in audio_inputs.items()},
+                        max_new_tokens=max_tokens,
+                        temperature=temperature if temperature > 0 else None,
+                        do_sample=temperature > 0,
+                        top_p=top_p if temperature > 0 else None,
+                    )
+
+                generated_ids = output_ids[0][input_ids.shape[1]:]
+                text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+                if self._active_adapter is None:
+                    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+
+                self._request_count += 1
+                self._total_tokens += len(generated_ids)
+
+                return {
+                    "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": self.model_path,
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": text.strip()},
+                                 "finish_reason": "stop" if len(generated_ids) < max_tokens else "length"}],
+                    "usage": {
+                        "prompt_tokens": total_input,
+                        "completion_tokens": len(generated_ids),
+                        "total_tokens": total_input + len(generated_ids),
+                        "cached_prefix_tokens": 0,
+                        "mean_entropy": 0.0,
+                        "audio": True,
+                    },
+                }
 
             # ── VISION MODE: multimodal input via processor ────────────
             if self._has_vision_content(messages):

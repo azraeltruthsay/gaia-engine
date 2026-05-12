@@ -275,6 +275,33 @@ class ThoughtManager:
         return False
 
 
+# ── Response post-processing ────────────────────────────────────────────────
+
+# Trailing artifacts the model sometimes emits after a clean response:
+#   '...response text\nassistant'                — fake new-turn header
+#   '...response text\n\nassistant\n'           — same with extra newlines
+#   '...response text\n<|user|>\nFake question' — fake template loop
+#   '...response text\n<image>'                  — leaked image placeholder
+# These are training-data residue (see GAIA_Project-kzb). Strip at emit time
+# so the response is clean even if the model didn't terminate perfectly.
+_TRAILING_ARTIFACT_RE = re.compile(
+    r'\s*(?:\n+(?:assistant|user|system)\b.*$)'
+    r'|\s*<\|(?:user|assistant|system|image|im_start|im_end)\|?>.*$',
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _clean_response_text(text: str) -> str:
+    """Strip trailing chat-template artifacts from a generated response.
+
+    See _TRAILING_ARTIFACT_RE. Idempotent; safe to apply to already-clean text.
+    """
+    if not text:
+        return text
+    cleaned = _TRAILING_ARTIFACT_RE.sub('', text)
+    return cleaned.strip()
+
+
 # ── Chat Template Formatting ────────────────────────────────────────────────
 
 class ChatFormatter:
@@ -737,10 +764,13 @@ class GAIAEngine:
                 # Use "eager" attention for Gemma 4 — "sdpa" triggers
                 # normal_kernel_cuda errors with Gemma4ClippableLinear layers.
                 logger.info("Loading NF4 directly to GPU (skip=%s)...", skip_modules)
+                # device_map={"": 0} forces every weight onto cuda:0. If GPU
+                # lacks capacity, raises rather than silently CPU-offloading
+                # (which produced mixed-device crashes on PILOT1 and Core 2.1).
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_path, trust_remote_code=True,
                     quantization_config=nf4_config,
-                    device_map="auto",
+                    device_map={"": 0},
                     low_cpu_mem_usage=True,
                     attn_implementation="eager",
                 )
@@ -1463,7 +1493,7 @@ class GAIAEngine:
                     "object": "chat.completion",
                     "created": int(time.time()),
                     "model": self.model_path,
-                    "choices": [{"index": 0, "message": {"role": "assistant", "content": text.strip()},
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": _clean_response_text(text)},
                                  "finish_reason": "stop" if len(generated_ids) < max_tokens else "length"}],
                     "usage": {
                         "prompt_tokens": total_input,
@@ -1515,7 +1545,7 @@ class GAIAEngine:
                     "object": "chat.completion",
                     "created": int(time.time()),
                     "model": self.model_path,
-                    "choices": [{"index": 0, "message": {"role": "assistant", "content": text.strip()},
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": _clean_response_text(text)},
                                  "finish_reason": "stop" if len(generated_ids) < max_tokens else "length"}],
                     "usage": {
                         "prompt_tokens": total_input,
@@ -1782,7 +1812,7 @@ class GAIAEngine:
                 "object": "chat.completion",
                 "created": int(time.time()),
                 "model": self.model_path,
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": text.strip()},
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": _clean_response_text(text)},
                              "finish_reason": "stop" if len(generated) < max_tokens else "length"}],
                 "usage": {
                     "prompt_tokens": total_input,

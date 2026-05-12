@@ -282,11 +282,16 @@ class ThoughtManager:
 #   '...response text\n\nassistant\n'           — same with extra newlines
 #   '...response text\n<|user|>\nFake question' — fake template loop
 #   '...response text\n<image>'                  — leaked image placeholder
+#   '...response text\n[Example: simple_instructions]' — annotation leak
+#   '...response text\n[Clock: 09:13 PM PDT ...]'    — world-state appendage
 # These are training-data residue (see GAIA_Project-kzb). Strip at emit time
 # so the response is clean even if the model didn't terminate perfectly.
 _TRAILING_ARTIFACT_RE = re.compile(
     r'\s*(?:\n+(?:assistant|user|system)\b.*$)'
-    r'|\s*<\|(?:user|assistant|system|image|im_start|im_end)\|?>.*$',
+    r'|\s*<\|(?:user|assistant|system|image|im_start|im_end)\|?>.*$'
+    r'|\s*\[Example:[^\]]*\]\s*$'
+    r'|\s*\[Clock:[^\]]*\]\s*$'
+    r'|\s*\[(?:User|Assistant|System)\]\s*$',
     re.DOTALL | re.IGNORECASE,
 )
 

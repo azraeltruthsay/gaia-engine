@@ -296,14 +296,43 @@ _TRAILING_ARTIFACT_RE = re.compile(
 )
 
 
+def _collapse_repeated_lines(text: str) -> str:
+    """Collapse runs of identical (or near-identical) lines.
+
+    Audio responses from V7 train often loop the same sentence:
+      'I hear a dog barking.\\nI hear a dog barking.\\nI hear a dog barking...'
+    Engine regex above catches structured artifacts at end-of-string, but
+    not this pattern (it's the SAME content repeating, not a fake new turn).
+
+    This function keeps the first occurrence of each line and drops
+    consecutive duplicates. Preserves intentional repetition that's part
+    of a single response (line-by-line poetry, etc.) by only collapsing
+    runs of 2+ identical lines down to one.
+    """
+    if not text:
+        return text
+    lines = text.split('\n')
+    out: list[str] = []
+    prev: str | None = None
+    for line in lines:
+        stripped = line.strip()
+        if stripped and stripped == prev:
+            continue  # drop consecutive duplicate
+        out.append(line)
+        prev = stripped if stripped else None
+    return '\n'.join(out)
+
+
 def _clean_response_text(text: str) -> str:
     """Strip trailing chat-template artifacts from a generated response.
 
     See _TRAILING_ARTIFACT_RE. Idempotent; safe to apply to already-clean text.
+    Also collapses repeated-line audio loops (GAIA_Project-6db extension).
     """
     if not text:
         return text
     cleaned = _TRAILING_ARTIFACT_RE.sub('', text)
+    cleaned = _collapse_repeated_lines(cleaned)
     return cleaned.strip()
 
 

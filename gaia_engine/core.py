@@ -1812,16 +1812,24 @@ class GAIAEngine:
                 text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL)
                 text = text.strip()
 
-            # Strip hallucinated tool calls — model may emit <tool_call>{...}
-            # even when no tools were requested. Extract text before the first
-            # tool_call block. Also strip <blockquote> wrappers.
-            if "<tool_call>" in text:
-                pre_tool = text.split("<tool_call>")[0].strip()
-                if pre_tool:
-                    text = pre_tool
-                else:
-                    # Entire response is tool calls — extract any natural language
-                    text = re.sub(r'<tool_call>.*?(?:</tool_call>|\})\s*', '', text, flags=re.DOTALL).strip()
+            # Tool-call passthrough (2026-05-15, GAIA_Project-8x1):
+            # Previously this block stripped ALL <tool_call>...</tool_call>
+            # output as "hallucinated." That was the right call before
+            # tool-routing training was reliable, but the engine is the
+            # wrong layer to decide what's a hallucination — it lacks the
+            # agent's context about whether tools are available, what the
+            # user asked for, and whether the JSON parses. Stripping here
+            # meant V8-V11 tool-call training appeared to fail end-to-end
+            # even though the model was correctly emitting the JSON envelope
+            # — the engine deleted it before the user saw it.
+            #
+            # Tool-call blocks now pass through unchanged. The agent layer
+            # (gaia-core's output_router + agent_core tool parsing) is the
+            # right place to validate, parse, and execute — or treat as
+            # natural text if parsing fails.
+            #
+            # Only the <blockquote> stripper remains because that's a
+            # genuine chat-template artifact, not structured agent output.
             if text.startswith("<blockquote>"):
                 text = re.sub(r'<blockquote>.*?</blockquote>\s*', '', text, flags=re.DOTALL).strip()
                 if not text:

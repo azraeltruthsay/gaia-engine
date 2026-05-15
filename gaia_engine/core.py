@@ -1461,7 +1461,8 @@ class GAIAEngine:
     def generate(self, messages: list, max_tokens: int = 512,
                  temperature: float = 0.7, top_p: float = 0.9,
                  skip_prefix: bool = False,
-                 enable_thinking: bool = True) -> dict:
+                 enable_thinking: bool = True,
+                 repetition_penalty: float = 1.1) -> dict:
         """Generate a chat completion with full introspection.
 
         Args:
@@ -1470,6 +1471,13 @@ class GAIAEngine:
                 as dynamic tokens. ~20 tokens/request instead of ~240.
             enable_thinking: If False, inject empty <think> block to
                 suppress Qwen3 chain-of-thought mode.
+            repetition_penalty: Divides logits of previously-generated
+                tokens by this factor before softmax (>1.0 discourages
+                repetition). Default 1.1 — mild penalty that breaks
+                degenerate "I'm not sure what to do" × N loops observed
+                with V11 adapter (GAIA_Project-0xw) without distorting
+                the natural-language distribution. Set to 1.0 to
+                disable.
         """
         with self._lock:
             import time as _time
@@ -1745,10 +1753,31 @@ class GAIAEngine:
             _MIN_TOKENS_BEFORE_SOFT_STOP = 3
             _entropy_sum = 0.0
             _entropy_count = 0
+            # Apply repetition penalty over a sliding window of recent
+            # tokens. 256 is large enough to span an entire "I'm not sure
+            # what to do." loop body (~7 tokens × 30+ repetitions) while
+            # keeping the cost negligible. We use a set for O(1) lookup
+            # and update incrementally as we append.
+            _REP_WINDOW = 256
+            _rep_window_set: set[int] = set()
             for step in range(max_tokens):
                 # Suppress <think> if the token exists in this model's vocab
                 if 0 <= _think_token_id < logits.shape[-1]:
                     logits[0, _think_token_id] = float("-inf")
+
+                # Repetition penalty — HF-style two-sided rescaling so it
+                # works for both positive and negative logits. Applied
+                # before temperature/top_p so the penalty interacts with
+                # the actual sampling distribution.
+                if repetition_penalty != 1.0 and _rep_window_set:
+                    rep_idx = torch.tensor(list(_rep_window_set), device=logits.device, dtype=torch.long)
+                    rep_logits = logits[0, rep_idx]
+                    rep_logits = torch.where(
+                        rep_logits > 0,
+                        rep_logits / repetition_penalty,
+                        rep_logits * repetition_penalty,
+                    )
+                    logits[0, rep_idx] = rep_logits
 
                 # Sample with single-pass softmax (avoid redundant computation)
                 if temperature > 0:
@@ -1783,6 +1812,13 @@ class GAIAEngine:
                 if token in _soft_stop and step >= _MIN_TOKENS_BEFORE_SOFT_STOP:
                     break
                 generated.append(token)
+                # Slide the repetition-penalty window forward
+                _rep_window_set.add(token)
+                if len(generated) > _REP_WINDOW:
+                    _evicted = generated[-_REP_WINDOW - 1]
+                    # Only evict from set if no other recent occurrence
+                    if _evicted not in generated[-_REP_WINDOW:]:
+                        _rep_window_set.discard(_evicted)
 
                 # Forward single token — capture hidden states every Nth token
                 _need_hidden = capture and (step % _SAE_STREAM_EVERY_N == 0)
@@ -2345,11 +2381,21 @@ class EngineHandler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                 else:
                     _template_kwargs = b.get("chat_template_kwargs", {})
+                    # Accept OpenAI's frequency_penalty alias too. OpenAI's
+                    # convention is additive (-2..2 added to logits); HF's
+                    # is multiplicative (>1 reduces repeat prob). They are
+                    # not equivalent in math but practically substitute —
+                    # we map frequency_penalty>0 to repetition_penalty>1.
+                    _rep_pen = b.get("repetition_penalty")
+                    if _rep_pen is None:
+                        _freq_pen = b.get("frequency_penalty", 0.0)
+                        _rep_pen = 1.0 + max(0.0, float(_freq_pen)) * 0.1 if _freq_pen else 1.1
                     result = _engine.generate(
                         b.get("messages", []), b.get("max_tokens", 512),
                         b.get("temperature", 0.7), b.get("top_p", 0.9),
                         skip_prefix=b.get("skip_prefix", False),
-                        enable_thinking=_template_kwargs.get("enable_thinking", True))
+                        enable_thinking=_template_kwargs.get("enable_thinking", True),
+                        repetition_penalty=float(_rep_pen))
                     self._json(result)
             except Exception as e:
                 logger.exception("Generation failed")

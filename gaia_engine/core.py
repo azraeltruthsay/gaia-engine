@@ -778,15 +778,20 @@ class GAIAEngine:
             try:
                 import bitsandbytes as bnb
                 from transformers import BitsAndBytesConfig
-                # For multimodal Gemma 4: skip NF4 on vision/audio towers.
-                # They use Gemma4ClippableLinear (native QAT) and double-
-                # quantizing through bnb produces an NF4/QAT shape mismatch
-                # in the forward pass (q_proj.weight.shape[1] != 1 assert).
-                # Towers stay in bf16 — ~3GB extra VRAM — but LM still gets
-                # the full NF4 footprint reduction.
+                # Skip NF4 on vision/audio towers. For Gemma 4, this is
+                # mandatory (Gemma4ClippableLinear native QAT vs bnb NF4
+                # double-quant causes an assert in the forward pass).
+                # For Qwen3-VL (and other VL families), the vision tower
+                # is small relative to the LM and benefits from bf16
+                # precision for image-token features — same convention.
                 skip_modules = ["lm_head"]
                 if self.has_vision:
-                    skip_modules.extend(["vision_tower", "audio_tower", "embed_vision", "embed_audio"])
+                    skip_modules.extend([
+                        # Gemma 4 names
+                        "vision_tower", "audio_tower", "embed_vision", "embed_audio",
+                        # Qwen3-VL / Qwen2-VL names
+                        "visual", "vision_model",
+                    ])
                 nf4_config = BitsAndBytesConfig(
                     load_in_4bit=True,
                     bnb_4bit_compute_dtype=torch.bfloat16,
@@ -797,17 +802,39 @@ class GAIAEngine:
                 # NF4 direct to GPU — quantization happens during loading.
                 # Use "eager" attention for Gemma 4 — "sdpa" triggers
                 # normal_kernel_cuda errors with Gemma4ClippableLinear layers.
-                logger.info("Loading NF4 directly to GPU (skip=%s)...", skip_modules)
                 # device_map={"": 0} forces every weight onto cuda:0. If GPU
                 # lacks capacity, raises rather than silently CPU-offloading
                 # (which produced mixed-device crashes on PILOT1 and Core 2.1).
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    model_path, trust_remote_code=True,
+                #
+                # Auto-class selection (2026-05-16): some VL architectures
+                # (e.g. Qwen3VLForConditionalGeneration) are not registered
+                # under AutoModelForCausalLM. When has_vision is True, prefer
+                # AutoModelForImageTextToText which covers both the
+                # Conditional-Generation VL pattern and the
+                # Image-Text-to-Text decoder pattern.
+                logger.info("Loading NF4 directly to GPU (skip=%s)...", skip_modules)
+                _nf4_kwargs = dict(
+                    trust_remote_code=True,
                     quantization_config=nf4_config,
                     device_map={"": 0},
                     low_cpu_mem_usage=True,
                     attn_implementation="eager",
                 )
+                _loaded = False
+                if self.has_vision:
+                    try:
+                        from transformers import AutoModelForImageTextToText
+                        self.model = AutoModelForImageTextToText.from_pretrained(
+                            model_path, **_nf4_kwargs)
+                        _loaded = True
+                        logger.info("NF4 + AutoModelForImageTextToText load succeeded")
+                    except Exception as _vl_err:
+                        logger.warning(
+                            "NF4 VL load via AutoModelForImageTextToText failed "
+                            "(%s) — falling back to AutoModelForCausalLM", _vl_err)
+                if not _loaded:
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        model_path, **_nf4_kwargs)
                 torch.cuda.empty_cache()
                 quant_mb = torch.cuda.memory_allocated() / (1024**2)
                 logger.info("NF4 model loaded: %.0fMB on GPU (CPU-first)", quant_mb)

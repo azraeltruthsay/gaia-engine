@@ -937,6 +937,55 @@ class GAIAEngine:
             except Exception as _audio_dq_err:
                 logger.warning("Audio tower dequant failed (audio inference may break): %s", _audio_dq_err)
 
+        # Vision tower dequant: SAME skip_modules nested-submodule failure as
+        # audio (GAIA_Project-5fh). vision_tower's nested Linear4bit get
+        # NF4-quantized despite the skip list, corrupting image features into
+        # noise — the model "sees" gray/garbage and cannot ground on the image.
+        # This was THE root cause of every Core 2.x vision-grounding failure
+        # (base+LoRA hid it by ignoring vision; the -it instruct model exposed
+        # it by trying to describe the garbage). Dequantize vision_tower +
+        # embed_vision to bf16 so grounding works. No-op when loaded in bf16.
+        if use_nf4 and getattr(self, "has_vision", False) and hasattr(self.model, "model"):
+            try:
+                import bitsandbytes as _bnb
+                import bitsandbytes.functional as _bnb_f
+                import torch.nn as _nn
+
+                to_replace = []
+                for name, mod in self.model.named_modules():
+                    if "vision_tower" not in name and "embed_vision" not in name:
+                        continue
+                    for an, ch in list(mod.named_children()):
+                        if isinstance(ch, _bnb.nn.Linear4bit):
+                            to_replace.append((mod, an, ch))
+
+                if to_replace:
+                    logger.info("Vision tower NF4 dequant: %d Linear4bit modules → bf16 (workaround for skip_modules; GAIA_Project-5fh)", len(to_replace))
+                    for parent, an, lin4 in to_replace:
+                        weight_gpu = lin4.weight.data
+                        qstate = lin4.weight.quant_state
+                        if weight_gpu.device.type != "cuda":
+                            weight_gpu = weight_gpu.cuda()
+                        dequant_gpu = _bnb_f.dequantize_4bit(weight_gpu, qstate)
+                        new_linear = _nn.Linear(
+                            lin4.in_features, lin4.out_features,
+                            bias=lin4.bias is not None,
+                            dtype=torch.bfloat16, device="cuda",
+                        )
+                        with torch.no_grad():
+                            new_linear.weight.copy_(dequant_gpu.to(torch.bfloat16))
+                            if lin4.bias is not None:
+                                new_linear.bias.copy_(lin4.bias.detach().to(torch.bfloat16))
+                        setattr(parent, an, new_linear)
+                        del lin4, dequant_gpu
+                    gc.collect()
+                    if device == "cuda":
+                        torch.cuda.empty_cache()
+                    _vram_mb = torch.cuda.memory_allocated() / (1024**2) if device == "cuda" else 0
+                    logger.info("Vision tower dequant complete (VRAM now: %.0fMB)", _vram_mb)
+            except Exception as _vision_dq_err:
+                logger.warning("Vision tower dequant failed (vision grounding may break): %s", _vision_dq_err)
+
         # Compile for speed — disable CUDA graphs to avoid conflicts
         # with dynamic KV cache sizes in autoregressive generation
         # Skip for MoE offloaded models — torch.compile doesn't support split device maps

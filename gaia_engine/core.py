@@ -902,9 +902,13 @@ class GAIAEngine:
                 import bitsandbytes.functional as _bnb_f
                 import torch.nn as _nn
 
+                # Also dequant embed_audio (the audio projector) — same nested
+                # skip_modules failure as embed_vision (GAIA_Project-5fh/m0b);
+                # the original audio fix covered audio_tower but missed the
+                # projector, leaving audio features partially corrupted.
                 to_replace = []
                 for name, mod in self.model.named_modules():
-                    if "audio_tower" not in name:
+                    if "audio_tower" not in name and "embed_audio" not in name:
                         continue
                     for an, ch in list(mod.named_children()):
                         if isinstance(ch, _bnb.nn.Linear4bit):

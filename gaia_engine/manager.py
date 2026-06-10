@@ -133,8 +133,10 @@ class EngineManager:
             if is_gguf:
                 # GGUF: try gaia_cpp in-process backend first (hidden states + speed)
                 # Falls back to llama-server subprocess if unavailable.
-                n_gpu_layers = 999 if device == "cuda" else 0
-                from gaia_engine.config import GGUF_CTX_SIZE, GGUF_THREADS, ENGINE_TIER
+                from gaia_engine.config import GGUF_CTX_SIZE, GGUF_THREADS, ENGINE_TIER, GGUF_GPU_LAYERS
+                # 999 = all layers; Gemma 4 GGUF needs (num_layers - 1) on CUDA
+                # to avoid a final-layer CUDA abort — see config.GGUF_GPU_LAYERS.
+                n_gpu_layers = GGUF_GPU_LAYERS if device == "cuda" else 0
                 ctx_size = GGUF_CTX_SIZE
                 threads = GGUF_THREADS
                 tier = ENGINE_TIER
@@ -487,7 +489,14 @@ class EngineManager:
                         self._drain_event.set()
 
     def health_response(self) -> dict:
-        """Build health response based on worker state."""
+        """Build health response based on worker state.
+
+        Always returns the canonical fields (``model_loaded``, ``mode``,
+        ``backend``, ``device``, ``model_path``) regardless of which backend is
+        active, so callers (orchestrator, readiness gates) can reason about
+        state consistently. llama-server's bare ``{"status":"ok"}`` body is
+        normalized rather than passed through.
+        """
         # gaia_cpp in-process backend
         with self._lock:
             cpp = self._cpp_backend
@@ -496,6 +505,10 @@ class EngineManager:
             h = cpp.health()
             h["managed"] = True
             h["model_loaded"] = True
+            h["mode"] = "active"
+            h["backend"] = self.backend or "cpp"
+            h["model_path"] = self.model_path or ""
+            h["device"] = self.device or h.get("device", "cpu")
             h["draining"] = self._draining
             h["active_inference"] = self._active_inference_count
             return h
@@ -510,99 +523,195 @@ class EngineManager:
                 self._cleanup_worker_state()
                 worker_alive = False
             model_loaded = worker_alive and self.worker_port is not None
+            backend = self.backend
+            device = self.device
+            model_path = self.model_path
+            worker_pid = self.worker_process.pid if worker_alive else None
 
         if model_loaded:
             # When inference is in flight, skip the proxy. The worker uses a
-            # single-threaded HTTPServer, so /health would queue behind
-            # /v1/chat/completions. For long requests (vision inference can
-            # run 60s+) this caused doctor health checks to time out at
-            # 5s × 4 retries, triggering spurious gaia-core restarts mid-
-            # battery. Manager-level state is sufficient for liveness.
+            # single-threaded HTTPServer (gaia-engine core.py), so /health
+            # would queue behind /v1/chat/completions. For long requests
+            # (vision inference can run 60s+) this caused doctor health
+            # checks to time out at 5s × 4 retries → spurious gaia-core
+            # restarts mid-battery. Manager-level state is sufficient for
+            # liveness; detailed per-token info isn't worth the head-of-line
+            # blocking.
             if self._active_inference_count > 0:
-                with self._lock:
-                    worker_pid = self.worker_process.pid if self.worker_process else None
                 return {
                     "status": "ok",
                     "engine": "gaia-managed",
-                    "backend": self.backend or "engine",
+                    "backend": backend or "engine",
                     "model_loaded": True,
                     "mode": "active",
                     "managed": True,
-                    "device": self.device or "unknown",
-                    "model_path": self.model_path or "",
+                    "device": device or "unknown",
+                    "model_path": model_path or "",
                     "worker_pid": worker_pid,
                     "draining": self._draining,
                     "active_inference": self._active_inference_count,
                     "health_source": "manager",
                 }
 
-            # Forward to worker for detailed health
+            # Forward to worker for detailed health. Inject canonical fields on
+            # top of whatever the worker returned so the shape is stable across
+            # backends (GAIA Engine Python worker returns ``model_loaded``;
+            # llama-server just returns ``{"status":"ok"}``).
             status, _, body = self.proxy_to_worker("GET", "/health", {})
             if status == 200:
                 try:
                     data = json.loads(body)
-                    data["managed"] = True
-                    data["device"] = self.device or "unknown"
-                    data["draining"] = self._draining
-                    data["active_inference"] = self._active_inference_count
-                    return data
                 except Exception:
-                    pass
+                    data = {}
+                data["status"] = data.get("status", "ok")
+                data["managed"] = True
+                data["model_loaded"] = True
+                data["mode"] = "active"
+                data["backend"] = backend or "engine"
+                data["device"] = device or data.get("device", "unknown")
+                data["model_path"] = model_path or data.get("model_path", "")
+                data["worker_pid"] = worker_pid
+                data["draining"] = self._draining
+                data["active_inference"] = self._active_inference_count
+                return data
             elif status in (502, 503) and worker_alive:
-                # Worker process alive but proxy broken — stale connection
+                # Worker process alive but proxy broken — stale connection.
+                # Report unhealthy rather than pretending all is well.
                 logger.warning(
                     "Worker alive (PID %s) but proxy returned %d — connection may be stale. "
                     "Port %s may not be reachable.",
-                    self.worker_process.pid if self.worker_process else "?",
-                    status, self.worker_port,
+                    worker_pid, status, self.worker_port,
                 )
+                return {
+                    "status": "degraded",
+                    "engine": "gaia-managed",
+                    "backend": backend or "unknown",
+                    "model_loaded": True,
+                    "mode": "degraded",
+                    "managed": True,
+                    "device": device or "unknown",
+                    "model_path": model_path or "",
+                    "worker_pid": worker_pid,
+                    "proxy_status": status,
+                    "draining": self._draining,
+                    "active_inference": self._active_inference_count,
+                }
 
         return {
             "status": "ok",
             "engine": "gaia-managed",
-            "backend": self.backend or "none",
+            "backend": backend or "none",
             "model_loaded": model_loaded,
             "mode": "active" if model_loaded else "standby",
             "managed": True,
-            "device": self.device or "none",
-            "worker_pid": self.worker_process.pid if worker_alive else None,
+            "device": device or "none",
+            "model_path": model_path or "",
+            "worker_pid": worker_pid,
             "draining": self._draining,
             "active_inference": self._active_inference_count,
         }
 
     def status_response(self) -> dict:
-        """Build status response."""
+        """Build status response.
+
+        llama-server (GGUF) doesn't implement ``/status``; synthesize from
+        our own state rather than fall through to a false "standby" answer.
+        """
         with self._lock:
+            cpp = self._cpp_backend
             worker_alive = (self.worker_process is not None
                             and self.worker_process.poll() is None)
+            backend = self.backend
+            device = self.device
+            model_path = self.model_path
+            worker_port = self.worker_port
 
-        if worker_alive and self.worker_port:
+        if cpp is not None:
+            return {
+                "mode": "active",
+                "model_loaded": True,
+                "managed": True,
+                "backend": backend or "cpp",
+                "device": device or "cpu",
+                "model_path": model_path or "",
+            }
+
+        if worker_alive and worker_port:
+            # GAIA Engine Python worker implements /status; llama-server does
+            # not. Try the forward, fall back to synthesized.
             status, _, body = self.proxy_to_worker("GET", "/status", {})
             if status == 200:
                 try:
                     data = json.loads(body)
                     data["managed"] = True
+                    data.setdefault("model_loaded", True)
+                    data.setdefault("mode", "active")
+                    data.setdefault("backend", backend or "engine")
+                    data.setdefault("device", device or "unknown")
+                    data.setdefault("model_path", model_path or "")
                     return data
                 except Exception:
                     pass
+            # Forward failed (e.g. llama-server 404) — synthesize.
+            return {
+                "mode": "active",
+                "model_loaded": True,
+                "managed": True,
+                "backend": backend or "gguf",
+                "device": device or "unknown",
+                "model_path": model_path or "",
+            }
 
-        return {"mode": "standby", "model_loaded": False, "managed": True}
+        return {"mode": "standby", "model_loaded": False, "managed": True,
+                "backend": backend or "none"}
 
     def model_info_response(self) -> dict:
-        """Build model info response."""
+        """Build model info response.
+
+        llama-server doesn't implement ``/model/info``; synthesize from
+        manager state instead of returning a false ``model_loaded=False``.
+        """
         with self._lock:
+            cpp = self._cpp_backend
             worker_alive = (self.worker_process is not None
                             and self.worker_process.poll() is None)
+            backend = self.backend
+            device = self.device
+            model_path = self.model_path
+            worker_port = self.worker_port
 
-        if worker_alive and self.worker_port:
+        if cpp is not None:
+            return {
+                "model_loaded": True,
+                "model_path": model_path or "",
+                "device": device or "cpu",
+                "backend": backend or "cpp",
+                "vram_mb": 0,
+            }
+
+        if worker_alive and worker_port:
             status, _, body = self.proxy_to_worker("GET", "/model/info", {})
             if status == 200:
                 try:
-                    return json.loads(body)
+                    data = json.loads(body)
+                    data.setdefault("model_loaded", True)
+                    data.setdefault("model_path", model_path or "")
+                    data.setdefault("device", device or "unknown")
+                    data.setdefault("backend", backend or "engine")
+                    return data
                 except Exception:
                     pass
+            # Forward failed (e.g. llama-server 404) — synthesize from our state
+            return {
+                "model_loaded": True,
+                "model_path": model_path or "",
+                "device": device or "unknown",
+                "backend": backend or "gguf",
+                "vram_mb": 0,
+            }
 
-        return {"model_loaded": False, "model_path": "", "device": "none", "vram_mb": 0}
+        return {"model_loaded": False, "model_path": "", "device": "none",
+                "backend": backend or "none", "vram_mb": 0}
 
     def _proxy_cpp(self, method: str, path: str, body: bytes, cpp) -> tuple:
         """Handle a request via the gaia_cpp in-process backend (non-streaming)."""

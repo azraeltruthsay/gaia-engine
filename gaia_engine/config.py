@@ -12,6 +12,15 @@ import os
 GGUF_CTX_SIZE: int = int(os.environ.get("GGUF_CTX_SIZE", os.environ.get("CORE_CPU_CTX", "16384")))
 GGUF_THREADS: int = int(os.environ.get("GGUF_THREADS", "16"))
 
+# GPU offload layer count for GGUF models when device="cuda". 999 = "all layers"
+# (llama.cpp clamps to the real count). NOTE: Gemma 4 GGUF crashes in the CUDA
+# graph when the FINAL layer/output is offloaded (llama.cpp abort in
+# llama_decode); set this to (num_layers - 1) — e.g. 33 for Gemma4-E4B — to
+# offload all-but-last and keep the crashing op on CPU. Validated 2026-06-09
+# for the Discord-voice GGUF-on-GPU "voice gear" (GAIA_Project-a1t): E4B GGUF
+# at 33 layers ≈ 3.7GB VRAM, 30-48 tok/s, no crash. Other archs are fine at 999.
+GGUF_GPU_LAYERS: int = int(os.environ.get("GGUF_GPU_LAYERS", "999"))
+
 # ── Identity ─────────────────────────────────────────────────────────────────
 
 ENGINE_TIER: str = os.environ.get("GAIA_ENGINE_TIER", "prime")

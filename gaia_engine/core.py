@@ -490,7 +490,11 @@ class PrefixCache:
         text = self.formatter.format_system(prefix) + "\n"
         ids = self.tokenizer.encode(text, return_tensors="pt").to(self.device)
 
-        out = self.model(ids, use_cache=True)
+        # logits_to_keep=1: this prefix warmup only needs the KV cache, not the
+        # logits. Computing logits for every position (seq_len × vocab) is a large
+        # tensor that OOMs on a 16GB GPU for long prompts; we only ever read the
+        # last-token logit downstream, so compute just that.
+        out = self.model(ids, use_cache=True, logits_to_keep=1)
         self._cached_kv = out.past_key_values
         self._cached_len = ids.shape[1]
         self._hashes = current_hashes
@@ -1807,8 +1811,12 @@ class GAIAEngine:
             capture = self.monitor.enabled
             if capture:
                 from gaia_engine.config import ENGINE_TIER
+            # logits_to_keep=1: only the last position's logits are needed for
+            # next-token generation. Computing them for the whole prompt
+            # (seq_len × 262k vocab → ~1-1.4GB) OOMs the prefill on a 16GB GPU.
             out = self.model(input_ids, past_key_values=current_kv,
-                              use_cache=True, output_hidden_states=False)
+                              use_cache=True, output_hidden_states=False,
+                              logits_to_keep=1)
             current_kv = out.past_key_values
             logits = out.logits[:, -1, :]
 
@@ -2066,8 +2074,11 @@ class GAIAEngine:
 
             # Skip hidden states on prompt forward — all-layer activations for
             # long prompts OOM on 16GB GPU. Capture during autoregressive loop only.
+            # logits_to_keep=1: only the last position's logits are needed for
+            # next-token generation. Computing them for the whole prompt
+            # (seq_len × 262k vocab → ~1-1.4GB) OOMs the prefill on a 16GB GPU.
             out = self.model(input_ids, use_cache=True,
-                             output_hidden_states=False)
+                             output_hidden_states=False, logits_to_keep=1)
             current_kv = out.past_key_values
             logits = out.logits[:, -1, :]
 

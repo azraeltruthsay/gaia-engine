@@ -42,6 +42,11 @@ struct HiddenStateCaptureState {
     // The callback is a no-op when active=false.
     std::atomic<bool> active{false};
 
+    // When true, capture ALL token positions (n_embd × n_tokens, token-major)
+    // instead of just the last. Opt-in for SAE atlas recording (xzi); default
+    // false preserves the last-token behavior the polygraph expects.
+    std::atomic<bool> all_tokens{false};
+
     // Populated during llama_decode(). Read after decode returns.
     // Protected by mtx during writes from the callback.
     std::unordered_map<int, LayerCapture> captures;
@@ -133,48 +138,56 @@ static bool gaia_cb_eval(struct ggml_tensor* t, bool ask, void* user_data) {
     int64_t n_tokens = t->ne[1];
     if (n_embd <= 0 || n_tokens <= 0) return false;
 
-    // We want the LAST token's hidden state (most recently predicted position)
-    int64_t last_tok = n_tokens - 1;
-    size_t byte_offset = static_cast<size_t>(last_tok) * t->nb[1];
+    // Last token by default; ALL positions when opted in (SAE atlas, xzi). Data
+    // is token-major / n_embd-contiguous: [tok0 n_embd][tok1 n_embd]... so the
+    // Python side reshapes flat → (n_captured_tokens, n_embd).
+    const bool grab_all = state->all_tokens.load(std::memory_order_acquire);
+    const int64_t first_tok = grab_all ? 0 : (n_tokens - 1);
+    const int64_t count_tok = grab_all ? n_tokens : 1;
 
     LayerCapture cap;
     cap.layer_idx = layer;
     cap.n_embd = n_embd;
-    cap.data.resize(static_cast<size_t>(n_embd));
+    cap.data.resize(static_cast<size_t>(n_embd) * static_cast<size_t>(count_tok));
 
     if (t->type == GGML_TYPE_F32) {
-        // Direct copy — most common for CPU inference
-        ggml_backend_tensor_get(t, cap.data.data(), byte_offset,
-                                static_cast<size_t>(n_embd) * sizeof(float));
+        for (int64_t k = 0; k < count_tok; ++k) {
+            size_t byte_offset = static_cast<size_t>(first_tok + k) * t->nb[1];
+            ggml_backend_tensor_get(
+                t, cap.data.data() + static_cast<size_t>(k) * static_cast<size_t>(n_embd),
+                byte_offset, static_cast<size_t>(n_embd) * sizeof(float));
+        }
     } else if (t->type == GGML_TYPE_F16) {
-        // F16 → F32 conversion
         std::vector<uint16_t> f16_buf(static_cast<size_t>(n_embd));
-        ggml_backend_tensor_get(t, f16_buf.data(), byte_offset,
-                                static_cast<size_t>(n_embd) * sizeof(uint16_t));
-        // Manual F16 → F32 (IEEE 754 half-precision)
-        for (int64_t i = 0; i < n_embd; ++i) {
-            uint16_t h = f16_buf[static_cast<size_t>(i)];
-            uint32_t sign = (h >> 15) & 0x1;
-            uint32_t exp  = (h >> 10) & 0x1F;
-            uint32_t mant = h & 0x3FF;
-            uint32_t f32_bits;
-            if (exp == 0) {
-                if (mant == 0) {
-                    f32_bits = sign << 31;
+        for (int64_t k = 0; k < count_tok; ++k) {
+            size_t byte_offset = static_cast<size_t>(first_tok + k) * t->nb[1];
+            ggml_backend_tensor_get(t, f16_buf.data(), byte_offset,
+                                    static_cast<size_t>(n_embd) * sizeof(uint16_t));
+            float* out = cap.data.data() + static_cast<size_t>(k) * static_cast<size_t>(n_embd);
+            for (int64_t i = 0; i < n_embd; ++i) {
+                uint16_t h = f16_buf[static_cast<size_t>(i)];
+                uint32_t sign = (h >> 15) & 0x1;
+                uint32_t exp  = (h >> 10) & 0x1F;
+                uint32_t mant = h & 0x3FF;
+                uint32_t f32_bits;
+                if (exp == 0) {
+                    if (mant == 0) {
+                        f32_bits = sign << 31;
+                    } else {
+                        // Denormal
+                        exp = 1;
+                        while (!(mant & 0x400)) { mant <<= 1; --exp; }
+                        mant &= 0x3FF;
+                        f32_bits = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+                    }
+                } else if (exp == 31) {
+                    // Inf or NaN
+                    f32_bits = (sign << 31) | (0xFF << 23) | (mant << 13);
                 } else {
-                    // Denormal
-                    exp = 1;
-                    while (!(mant & 0x400)) { mant <<= 1; --exp; }
-                    mant &= 0x3FF;
                     f32_bits = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
                 }
-            } else if (exp == 31) {
-                // Inf or NaN
-                f32_bits = (sign << 31) | (0xFF << 23) | (mant << 13);
-            } else {
-                f32_bits = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+                memcpy(&out[static_cast<size_t>(i)], &f32_bits, sizeof(float));
             }
-            memcpy(&cap.data[static_cast<size_t>(i)], &f32_bits, sizeof(float));
         }
     } else {
         // Unsupported type (e.g., Q8_0 activations — shouldn't happen for l_out)

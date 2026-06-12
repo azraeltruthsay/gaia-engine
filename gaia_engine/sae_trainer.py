@@ -141,6 +141,7 @@ class SAETrainer:
 
     def record_activations_gguf(self, prompts: List[str], layers: List[int],
                                  backend=None, n_embd: Optional[int] = None,
+                                 capture_all_tokens: bool = False,
                                  system_prompt: str = "You are GAIA, a sovereign AI.",
                                  chat_format: bool = True) -> Dict:
         """Record per-layer residual activations from the GGUF/llama.cpp backend.
@@ -176,6 +177,17 @@ class SAETrainer:
         if not hasattr(backend, "generate"):
             raise TypeError("record_activations_gguf needs a gaia_cpp backend with .generate(); "
                             "got %r" % type(backend))
+
+        # xzi: opt into all-token capture (n_embd × n_tokens per prompt → ~seq_len×
+        # more samples). Needs the gaia_cpp all-token build; resolve n_embd from the
+        # backend so the per-token reshape is exact.
+        if capture_all_tokens and hasattr(backend, "set_capture_all_tokens"):
+            backend.set_capture_all_tokens(True)
+            if n_embd is None and hasattr(backend, "n_embd"):
+                try:
+                    n_embd = int(backend.n_embd())
+                except Exception:
+                    pass
 
         self.activations = {l: [] for l in layers}
         total_tokens = 0
@@ -234,6 +246,13 @@ class SAETrainer:
             if (i + 1) % 50 == 0:
                 logger.info("  Recorded %d/%d prompts (%d tokens)", i + 1, len(prompts), total_tokens)
 
+        # Restore the backend's default (last-token) capture so we don't affect
+        # the polygraph or other consumers after recording.
+        if capture_all_tokens and hasattr(backend, "set_capture_all_tokens"):
+            try:
+                backend.set_capture_all_tokens(False)
+            except Exception:
+                pass
         elapsed = time.time() - start
         stats = {
             "prompts": len(prompts),

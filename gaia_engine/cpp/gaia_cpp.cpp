@@ -220,6 +220,16 @@ public:
         capture_state_.capture_layers = std::move(layers);
     }
 
+    // xzi: opt into capturing ALL prompt-token residuals (n_embd × n_tokens)
+    // instead of just the last token — for SAE atlas sample efficiency. Default
+    // off keeps the polygraph's last-token behavior.
+    void set_capture_all_tokens(bool enabled) {
+        capture_state_.all_tokens.store(enabled, std::memory_order_release);
+    }
+    bool capture_all_tokens() const {
+        return capture_state_.all_tokens.load(std::memory_order_acquire);
+    }
+
 private:
     std::string model_path_;
     llama_model* model_ = nullptr;
@@ -485,5 +495,8 @@ PYBIND11_MODULE(gaia_cpp, m) {
         .def("has_gpu",         &LlamaCppBackend::has_gpu)
         .def("model_path",      &LlamaCppBackend::model_path)
         .def("capture_layers",  &LlamaCppBackend::capture_layers)
-        .def("set_capture_layers", &LlamaCppBackend::set_capture_layers);
+        .def("set_capture_layers", &LlamaCppBackend::set_capture_layers)
+        .def("capture_all_tokens", &LlamaCppBackend::capture_all_tokens)
+        .def("set_capture_all_tokens", &LlamaCppBackend::set_capture_all_tokens,
+            py::arg("enabled"));
 }

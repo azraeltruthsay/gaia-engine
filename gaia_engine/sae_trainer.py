@@ -139,6 +139,116 @@ class SAETrainer:
         logger.info("Recording complete: %d prompts, %d tokens, %.1fs", len(prompts), total_tokens, elapsed)
         return stats
 
+    def record_activations_gguf(self, prompts: List[str], layers: List[int],
+                                 backend=None, n_embd: Optional[int] = None,
+                                 system_prompt: str = "You are GAIA, a sovereign AI.",
+                                 chat_format: bool = True) -> Dict:
+        """Record per-layer residual activations from the GGUF/llama.cpp backend.
+
+        The GGUF twin of record_activations(): captures the residual stream via
+        gaia_cpp's capture_hidden and populates self.activations in the SAME
+        {layer_idx: [tensor]} shape that train_sae() consumes — so we can build SAE
+        atlases on the *production* (quantized, CPU) activations, not just the
+        safetensors GPU model.
+
+        Capture mechanics (gaia_cpp): generate with max_tokens=0 so the prompt
+        prefill states survive (the autoregressive loop would otherwise overwrite
+        the capture with the last generated token). NOTE: the current
+        hidden_state_capture.hpp grabs only the LAST prompt token's state per layer
+        (one n_embd vector), so each prompt yields 1 sample/layer — use a large
+        corpus, or upgrade the C++ capture to all-token for ~seq_len× more samples.
+        If that upgrade lands, pass `n_embd` and this recorder reshapes per-token.
+
+        Layer indexing: gaia_cpp 'l_out-N' == transformers hidden_states[N+1]; pick
+        `layers` consistently with the safetensors run when comparing atlases.
+
+        Args:
+            prompts: corpus.
+            layers: ggml layer indices to keep (others captured are discarded).
+            backend: a gaia_cpp.LlamaCppBackend-like object exposing
+                generate(prompt, max_tokens, capture_hidden) -> result with
+                .hidden_states {layer:int -> 1-D float array} and .prompt_tokens.
+                Defaults to self.model.
+        """
+        import numpy as np
+
+        backend = backend or self.model
+        if not hasattr(backend, "generate"):
+            raise TypeError("record_activations_gguf needs a gaia_cpp backend with .generate(); "
+                            "got %r" % type(backend))
+
+        self.activations = {l: [] for l in layers}
+        total_tokens = 0
+        logger.info("Recording GGUF activations for %d prompts at layers %s", len(prompts), layers)
+        start = time.time()
+
+        # Chat-format to match production prompting (best-effort).
+        _fmt = None
+        if chat_format and self.tokenizer is not None:
+            try:
+                from gaia_engine.core import ChatFormatter
+                _fmt = ChatFormatter(self.tokenizer)
+            except Exception:
+                _fmt = None
+
+        for i, prompt_text in enumerate(prompts):
+            if _fmt is not None:
+                try:
+                    full = (_fmt.format_system(system_prompt) + "\n"
+                            + _fmt.format_message("user", prompt_text) + "\n"
+                            + _fmt.assistant_prefix(enable_thinking=True))
+                except Exception:
+                    full = prompt_text
+            else:
+                full = prompt_text
+
+            try:
+                # max_tokens=0 → prefill only; capture holds the prompt states.
+                result = backend.generate(full, max_tokens=0, capture_hidden=True)
+            except Exception:
+                logger.warning("GGUF generate failed on prompt %d; skipping", i, exc_info=True)
+                continue
+
+            n_tok = int(getattr(result, "prompt_tokens", 0) or 0)
+            total_tokens += n_tok
+            hs = getattr(result, "hidden_states", None) or {}
+
+            for layer_idx in layers:
+                flat = hs.get(layer_idx)
+                if flat is None:
+                    continue
+                flat = np.asarray(flat, dtype=np.float32).reshape(-1)
+                if flat.size == 0:
+                    continue
+                # Layout: only reshape per-token when n_embd is KNOWN and the
+                # capture is genuinely all-token (flat == n_embd * n_tok). Size
+                # alone can't disambiguate — a last-token n_embd vector can falsely
+                # divide by a small n_tok — so default to last-token (one n_embd
+                # vector), the current gaia_cpp behavior.
+                if n_embd and n_tok > 0 and flat.size == n_embd * n_tok:
+                    arr = flat.reshape(n_tok, n_embd)
+                else:
+                    arr = flat.reshape(1, flat.size)
+                self.activations[layer_idx].append(torch.from_numpy(arr.copy()))
+
+            if (i + 1) % 50 == 0:
+                logger.info("  Recorded %d/%d prompts (%d tokens)", i + 1, len(prompts), total_tokens)
+
+        elapsed = time.time() - start
+        stats = {
+            "prompts": len(prompts),
+            "tokens": total_tokens,
+            "layers": layers,
+            "backend": "gguf",
+            "elapsed_s": round(elapsed, 1),
+            "activations_per_layer": {
+                l: sum(a.shape[0] for a in acts) for l, acts in self.activations.items()
+            },
+        }
+        logger.info("GGUF recording complete: %d prompts, %d tokens, %.1fs",
+                    len(prompts), total_tokens, elapsed)
+        return stats
+
     def train_sae(self, layers: Optional[List[int]] = None,
                    num_features: int = 4096,
                    sparsity_weight: float = 0.01,

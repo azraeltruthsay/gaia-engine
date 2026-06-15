@@ -37,15 +37,22 @@ logger = logging.getLogger("GAIA.SAE")
 class SparseAutoencoder(nn.Module):
     """Sparse Autoencoder for decomposing model activations into interpretable features.
 
-    Architecture: input → encoder (expand) → ReLU → decoder (compress)
+    Architecture: input → encoder (expand) → ReLU → [top-k] → decoder (compress)
     The encoder expands hidden_size → num_features (overcomplete basis).
-    Sparsity is enforced via L1 penalty on the encoded representation.
+
+    Sparsity modes:
+      - L1 (k=None): ReLU activations, sparsity from an external L1 penalty
+        (sparsity_weight in train_sae). Tends toward dense/polysemantic.
+      - top-k (k=int): keep only the k strongest features per sample, zero the
+        rest. Enforces L0=k DIRECTLY — no penalty to tune — giving sparse,
+        discriminative (monosemantic-leaning) features. The modern fix.
     """
 
-    def __init__(self, hidden_size: int, num_features: int):
+    def __init__(self, hidden_size: int, num_features: int, k: Optional[int] = None):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_features = num_features
+        self.k = k if (k and 0 < k < num_features) else None
 
         self.encoder = nn.Linear(hidden_size, num_features)
         self.decoder = nn.Linear(num_features, hidden_size)
@@ -54,18 +61,23 @@ class SparseAutoencoder(nn.Module):
         with torch.no_grad():
             self.decoder.weight.copy_(self.encoder.weight.t())
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass: encode → decode.
-
-        Returns: (reconstructed, encoded)
-        """
+    def _encode(self, x: torch.Tensor) -> torch.Tensor:
         encoded = F.relu(self.encoder(x))
+        if self.k is not None:
+            # Keep the top-k features per row; zero everything else.
+            vals, idx = torch.topk(encoded, self.k, dim=-1)
+            encoded = torch.zeros_like(encoded).scatter_(-1, idx, vals)
+        return encoded
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass: encode → [top-k] → decode. Returns (reconstructed, encoded)."""
+        encoded = self._encode(x)
         reconstructed = self.decoder(encoded)
         return reconstructed, encoded
 
     def get_feature_activations(self, x: torch.Tensor) -> torch.Tensor:
-        """Get feature activation strengths without reconstructing."""
-        return F.relu(self.encoder(x))
+        """Get feature activation strengths (top-k applied) without reconstructing."""
+        return self._encode(x)
 
 
 class SAETrainer:
@@ -273,10 +285,15 @@ class SAETrainer:
                    sparsity_weight: float = 0.01,
                    lr: float = 1e-3,
                    epochs: int = 50,
-                   batch_size: int = 256) -> Dict:
+                   batch_size: int = 256,
+                   top_k: Optional[int] = None) -> Dict:
         """Train Sparse Autoencoders on recorded activations.
 
         One SAE per layer, each learning an overcomplete basis of features.
+
+        top_k: if set, each SAE keeps only the k strongest features per sample
+            (L0=k enforced directly — no sparsity_weight tuning). Gives sparse,
+            discriminative features; the fix for the dense/polysemantic atlas.
         """
         # Re-enable gradients — core.py disables them globally for inference,
         # but SAE training needs backprop through the autoencoder parameters.
@@ -311,7 +328,7 @@ class SAETrainer:
             all_acts_norm = (all_acts - mean) / std
 
             # Create SAE in float32
-            sae = SparseAutoencoder(hidden_size, num_features).to(dtype=torch.float32, device=self.device)
+            sae = SparseAutoencoder(hidden_size, num_features, k=top_k).to(dtype=torch.float32, device=self.device)
             optimizer = torch.optim.Adam(sae.parameters(), lr=lr)
 
             # Move data to device — ensure contiguous float32, detached from model graph
@@ -354,13 +371,13 @@ class SAETrainer:
                     avg_loss = total_loss / n_batches
                     avg_recon = total_recon / n_batches
                     avg_sparse = total_sparse / n_batches
-                    # Count active features (> 0.1 mean activation)
                     with torch.no_grad():
                         _, enc = sae(all_acts_device[:1000])
-                        active = (enc.mean(dim=0) > 0.01).sum().item()
-                    logger.info("  Layer %d epoch %d/%d: loss=%.4f (recon=%.4f sparse=%.4f) active=%d/%d",
+                        active = (enc.mean(dim=0) > 0.01).sum().item()   # features ever-active
+                        l0 = (enc > 1e-6).float().sum(dim=-1).mean().item()  # features/sample (the real measure)
+                    logger.info("  Layer %d epoch %d/%d: loss=%.4f (recon=%.4f sparse=%.4f) L0=%.1f active=%d/%d",
                                 layer_idx, epoch + 1, epochs, avg_loss, avg_recon, avg_sparse,
-                                active, num_features)
+                                l0, active, num_features)
 
             elapsed = time.time() - start
             sae.eval()
@@ -370,6 +387,7 @@ class SAETrainer:
             with torch.no_grad():
                 _, final_enc = sae(all_acts_device)
                 active_features = (final_enc.mean(dim=0) > 0.01).sum().item()
+                l0_per_sample = (final_enc > 1e-6).float().sum(dim=-1).mean().item()
                 top_features = final_enc.mean(dim=0).topk(10)
 
             # Store normalization params for inference
@@ -380,6 +398,8 @@ class SAETrainer:
                 "samples": n_samples,
                 "features": num_features,
                 "active_features": active_features,
+                "l0_per_sample": round(l0_per_sample, 2),
+                "top_k": top_k,
                 "final_loss": round(total_loss / n_batches, 4),
                 "training_time_s": round(elapsed, 1),
                 "top_feature_indices": top_features.indices.tolist(),

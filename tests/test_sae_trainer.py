@@ -88,3 +88,30 @@ def test_gguf_recorder_rejects_non_backend():
         assert False, "expected TypeError for backend without .generate()"
     except TypeError:
         pass
+
+
+# ── top-k SAE: direct L0 sparsity (GAIA_Project-bup) ────────────────────────
+
+def test_topk_sae_enforces_l0():
+    from gaia_engine.sae_trainer import SparseAutoencoder
+    sae = SparseAutoencoder(hidden_size=8, num_features=16, k=3)
+    x = torch.randn(5, 8)
+    recon, enc = sae(x)
+    # Each sample keeps at most k=3 nonzero features (L0 ≤ k), not all 16.
+    nnz = (enc.abs() > 1e-8).sum(dim=-1)
+    assert int(nnz_max := nnz.max().item()) <= 3
+    assert recon.shape == x.shape
+
+
+def test_l1_sae_unchanged_when_k_none():
+    from gaia_engine.sae_trainer import SparseAutoencoder
+    sae = SparseAutoencoder(hidden_size=8, num_features=16, k=None)
+    assert sae.k is None
+    _, enc = sae(torch.randn(4, 8))
+    assert enc.shape == (4, 16)   # ReLU mode: no top-k masking
+
+
+def test_topk_ignored_if_k_ge_num_features():
+    from gaia_engine.sae_trainer import SparseAutoencoder
+    sae = SparseAutoencoder(hidden_size=8, num_features=16, k=99)
+    assert sae.k is None          # k >= num_features → falls back to L1/ReLU

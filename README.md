@@ -24,7 +24,7 @@ Not a general-purpose inference server. Optimized for single-user, single-GPU de
 ```python
 from gaia_engine import GAIAEngine, serve
 
-engine = GAIAEngine("/models/Qwen3.5-2B", device="cuda")
+engine = GAIAEngine("/models/core", device="cuda")
 result = engine.generate(
     messages=[{"role": "user", "content": "Who are you?"}],
     max_tokens=128,
@@ -32,7 +32,7 @@ result = engine.generate(
 print(result["choices"][0]["message"]["content"])
 
 # As a server
-serve("/models/Qwen3.5-2B", port=8092)
+serve("/models/core", port=8092)
 ```
 
 ## Managed Mode (Zero-GPU Standby)
@@ -44,7 +44,7 @@ gaia-engine --managed --port 8092
 # Load model via HTTP
 curl -X POST http://localhost:8092/model/load \
   -H "Content-Type: application/json" \
-  -d '{"model": "/models/Qwen3.5-2B", "device": "cuda"}'
+  -d '{"model": "/models/core", "device": "cuda"}'
 
 # Inference
 curl -X POST http://localhost:8092/v1/chat/completions \

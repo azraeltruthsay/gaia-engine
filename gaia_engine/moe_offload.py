@@ -375,6 +375,12 @@ def load_moe_offloaded(model_path: str, device: str = "cuda",
     # hooks that break the autograd graph after .to("cuda"). Instead use
     # low_cpu_mem_usage=True which loads to CPU without dispatch infrastructure.
     logger.info("Loading bf16 model to CPU (low_cpu_mem_usage, no device_map)...")
+    # Pre-load config to register the gemma4 architecture mapping before
+    # AutoModelForCausalLM resolves the class (trust_remote_code registration
+    # is lazy). AutoModelForCausalLM itself is already imported above.
+    from transformers import AutoConfig
+    AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+
     # Use AutoModelForCausalLM for inference (resolves to Gemma4ForConditionalGeneration
     # which handles generation correctly). For TRAINING, callers should use
     # Gemma4ForCausalLM directly (text-only, gradient-compatible).

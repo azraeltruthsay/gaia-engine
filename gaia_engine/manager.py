@@ -46,6 +46,34 @@ _MANAGER_PATHS = {"/model/load", "/model/unload", "/model/swap", "/health", "/st
                   "/model/migrate"}
 
 
+def _hide_cuda(environ) -> None:
+    """Mask CUDA in `environ` (a mutable mapping), remembering the true prior value.
+
+    Empty string counts as ABSENT: masking twice must never enshrine the
+    mask itself as the "original". (GAIA_Project-3tch: repeated CPU/GGUF
+    loads across gear cycles saved ORIGINAL_CUDA_VISIBLE_DEVICES="" and
+    every later cuda spawn faithfully "restored" blindness — NF4 fell
+    back to a bf16 CPU grind.)
+    """
+    prior = environ.get("CUDA_VISIBLE_DEVICES", "")
+    if prior and "ORIGINAL_CUDA_VISIBLE_DEVICES" not in environ:
+        environ["ORIGINAL_CUDA_VISIBLE_DEVICES"] = prior
+    environ["CUDA_VISIBLE_DEVICES"] = ""
+
+
+def _expose_cuda(environ) -> None:
+    """Undo _hide_cuda in `environ`: restore a real prior value, else unset.
+
+    An empty ORIGINAL_CUDA_VISIBLE_DEVICES is treated as absent — restoring
+    "" would be restoring blindness.
+    """
+    original = environ.get("ORIGINAL_CUDA_VISIBLE_DEVICES", "")
+    if original:
+        environ["CUDA_VISIBLE_DEVICES"] = original
+    else:
+        environ.pop("CUDA_VISIBLE_DEVICES", None)
+
+
 def _find_free_port() -> int:
     """Find an available ephemeral port."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -141,6 +169,14 @@ class EngineManager:
                 threads = GGUF_THREADS
                 tier = ENGINE_TIER
 
+                # Hide/restore GPU visibility in environment before loading C++ bindings
+                # to prevent allocating CUDA contexts on CPU. Empty-string-is-absent
+                # semantics (3tch) — see _hide_cuda/_expose_cuda.
+                if n_gpu_layers > 0:
+                    _expose_cuda(os.environ)
+                else:
+                    _hide_cuda(os.environ)
+
                 try:
                     from gaia_engine.cpp import is_available, GaiaCppBackendAdapter
                     if is_available():
@@ -188,6 +224,11 @@ class EngineManager:
                 ]
 
             env = os.environ.copy()
+            if device == "cuda":
+                _expose_cuda(env)
+            else:
+                _hide_cuda(env)
+
             # Pass quantize config via env if needed (avoids CLI arg complexity)
             if quantize:
                 env["GAIA_ENGINE_QUANTIZE"] = quantize

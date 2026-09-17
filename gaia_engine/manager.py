@@ -228,6 +228,19 @@ class EngineManager:
                 _expose_cuda(env)
             else:
                 _hide_cuda(env)
+                # 7lih: CPU safetensors path never capped BLAS/torch intra-op
+                # threading -- a single generation call would spin up threads
+                # across every host core (no CORE_CPU_THREADS enforcement
+                # existed here at all; the GGUF branch above reads a
+                # differently-named GGUF_THREADS instead), starving the
+                # container's own uvicorn accept loop badly enough that even
+                # /health became unreachable and gaia-doctor SIGKILLed the
+                # container mid-inference. CORE_CPU_THREADS is already set
+                # in docker-compose (candidate: 8) for exactly this purpose;
+                # it was just never wired to anything for this backend.
+                cpu_threads = os.environ.get("CORE_CPU_THREADS", "8")
+                env["OMP_NUM_THREADS"] = cpu_threads
+                env["MKL_NUM_THREADS"] = cpu_threads
 
             # Pass quantize config via env if needed (avoids CLI arg complexity)
             if quantize:

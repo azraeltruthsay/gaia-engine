@@ -440,6 +440,33 @@ class ChatFormatter:
         return ids
 
 
+class GPUUnavailableError(RuntimeError):
+    """Raised when an engine instance expects CUDA but the driver context is
+    dead (e.g. a stale context left behind by a host reboot — GAIA_Project-t0f2).
+
+    Deliberately NOT a silent-degrade: once torch.cuda's lazy init has failed
+    once in a process, every subsequent torch.cuda.* call (including
+    synchronize()/empty_cache() inside migrate_to("cpu")) fails the same way,
+    so there is no safe in-process recovery — only a process restart clears
+    the wedged context. The point of this exception is purely to fail fast
+    with a clear, catchable signal instead of a cryptic multi-frame-deep
+    torch RuntimeError, so callers (do_POST, and eventually health checks /
+    gaia-doctor) can tell "GPU is dead" apart from an ordinary generation
+    error. See GAIA_Project-448j.
+    """
+
+
+def _require_cuda_healthy(device: str) -> None:
+    """Fail fast with a clear error if `device` is cuda but CUDA is dead."""
+    if device == "cuda" and not torch.cuda.is_available():
+        raise GPUUnavailableError(
+            "CUDA is unavailable (torch.cuda.is_available() is False) but "
+            "this engine instance expects device='cuda'. The CUDA driver "
+            "context is likely stale (host reboot, driver reset) — this "
+            "worker process needs to be restarted."
+        )
+
+
 # ── KV Prefix Cache ──────────────────────────────────────────────────────────
 
 class PrefixCache:
@@ -482,6 +509,7 @@ class PrefixCache:
             return self._cached_kv, self._cached_len
 
         # Recompute
+        _require_cuda_healthy(self.device)
         self._misses += 1
         prefix = "\n\n".join(v for v in self.segments.values() if v)
         if not prefix.strip():
@@ -1564,6 +1592,11 @@ class GAIAEngine:
                 disable.
         """
         with self._lock:
+            # Fail fast on a dead CUDA context (GAIA_Project-448j/t0f2) instead
+            # of crashing many frames deep inside audio/vision/text generation —
+            # every branch below eventually touches the GPU if self.device=='cuda'.
+            _require_cuda_healthy(self.device)
+
             import time as _time
             from datetime import datetime, timezone, timedelta
 
@@ -2004,6 +2037,9 @@ class GAIAEngine:
         # Reuse the same setup as generate() — build input_ids and KV cache
         # This is a simplified version that skips prefix cache for streaming
         with self._lock:
+            # See generate()'s matching check — GAIA_Project-448j/t0f2.
+            _require_cuda_healthy(self.device)
+
             # ── VISION MODE: non-streaming fallback for multimodal ────
             # Vision uses model.generate() which doesn't support our custom
             # token-by-token loop (needs pixel_values in the initial forward).
@@ -2488,6 +2524,18 @@ class EngineHandler(BaseHTTPRequestHandler):
                         enable_thinking=_template_kwargs.get("enable_thinking", True),
                         repetition_penalty=float(_rep_pen))
                     self._json(result)
+            except GPUUnavailableError as e:
+                # Distinct from a normal generation error (500) so the
+                # engine-manager proxy / gaia-core / gaia-doctor can tell
+                # "this worker's GPU context is dead, don't just retry the
+                # same request" apart from an ordinary bad-request/model
+                # failure. Only reaches the client on the non-streaming
+                # path — the streaming branch above has already sent a 200
+                # and headers before generate_stream() is first iterated,
+                # a pre-existing limitation of any mid-stream exception,
+                # not specific to this one.
+                logger.error("GPU unavailable: %s", e)
+                self._json({"error": str(e), "error_code": "GAIA-ENGINE-GPU-DEAD"}, 503)
             except Exception as e:
                 logger.exception("Generation failed")
                 self._json({"error": str(e)}, 500)

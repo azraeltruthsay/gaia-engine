@@ -543,6 +543,38 @@ class EngineManager:
                         self._drain_event.set()
 
     def health_response(self) -> dict:
+        """Build health response based on worker state, augmented with a
+        CUDA health check (GAIA_Project-t0f2).
+
+        A stale CUDA driver context (host reboot, driver reset) previously
+        left every health check reporting "healthy" right up until a real
+        inference request crashed -- health checks never exercised CUDA.
+        When this manager's tracked `device` is "cuda", actually probe
+        torch.cuda.is_available() (via gaia_engine.core.cuda_health_snapshot,
+        shared with the inference-path fail-fast guard from GAIA_Project-448j)
+        and downgrade `status` to "degraded" if it's dead -- gaia-doctor's
+        existing check_health() already treats any status=="degraded" body
+        as unhealthy and feeds it into the existing restart pipeline, so no
+        gaia-doctor changes are needed for this to take effect.
+        """
+        data = self._build_health_response()
+        device = data.get("device")
+        if device == "cuda":
+            try:
+                from gaia_engine.core import cuda_health_snapshot
+                cuda_ok, cuda_detail = cuda_health_snapshot(device)
+            except Exception as e:
+                # Fail open on the check's OWN plumbing (e.g. import error) --
+                # only a confirmed-dead GPU should degrade health, not an
+                # unrelated problem loading the checker itself.
+                cuda_ok, cuda_detail = True, f"cuda_health_snapshot unavailable: {e}"
+            data["cuda_healthy"] = cuda_ok
+            data["cuda_detail"] = cuda_detail
+            if not cuda_ok:
+                data["status"] = "degraded"
+        return data
+
+    def _build_health_response(self) -> dict:
         """Build health response based on worker state.
 
         Always returns the canonical fields (``model_loaded``, ``mode``,

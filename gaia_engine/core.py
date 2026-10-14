@@ -456,14 +456,35 @@ class GPUUnavailableError(RuntimeError):
     """
 
 
+def cuda_health_snapshot(device: str) -> Tuple[bool, str]:
+    """Non-raising CUDA health check, for health-check/observability callers
+    (GAIA_Project-t0f2) that want to REPORT a dead GPU rather than fail a
+    live request. Returns (healthy, detail).
+
+    GAIA_Project-t0f2's original incident showed torch.cuda.is_available()
+    itself can raise ("CUDA unknown error... Setting the available devices
+    to be zero.") rather than cleanly returning False when the driver
+    context is stale — so this wraps the call in try/except rather than
+    trusting it to always degrade to a boolean.
+    """
+    if device != "cuda":
+        return True, f"device={device!r} — CUDA not expected"
+    try:
+        if torch.cuda.is_available():
+            return True, "cuda available"
+        return False, "device='cuda' but torch.cuda.is_available() is False"
+    except Exception as e:
+        return False, f"device='cuda' but torch.cuda.is_available() raised {e.__class__.__name__}: {e}"
+
+
 def _require_cuda_healthy(device: str) -> None:
     """Fail fast with a clear error if `device` is cuda but CUDA is dead."""
-    if device == "cuda" and not torch.cuda.is_available():
+    healthy, detail = cuda_health_snapshot(device)
+    if not healthy:
         raise GPUUnavailableError(
-            "CUDA is unavailable (torch.cuda.is_available() is False) but "
-            "this engine instance expects device='cuda'. The CUDA driver "
-            "context is likely stale (host reboot, driver reset) — this "
-            "worker process needs to be restarted."
+            f"{detail}. The CUDA driver context is likely stale (host "
+            "reboot, driver reset) — this worker process needs to be "
+            "restarted."
         )
 
 

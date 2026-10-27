@@ -2390,14 +2390,19 @@ class EngineHandler(BaseHTTPRequestHandler):
                     vram = torch.cuda.memory_allocated() // (1024 ** 2)
                 except Exception:
                     pass
-            self._json({
+            health = {
                 "status": "ok",
                 "engine": "gaia",
                 "model_loaded": loaded,
                 "mode": "active" if loaded else "standby",
                 "device": _engine.device if _engine else "none",
                 "vram_mb": vram,
-            })
+            }
+            if loaded and _engine.device == "cuda":
+                # Probe CUDA here, in the process holding the GPU context; the
+                # manager's own view may be masked (8xr4.13).
+                health["cuda_healthy"], health["cuda_detail"] = cuda_health_snapshot("cuda")
+            self._json(health)
         elif self.path == "/v1/models":
             self._json({"object": "list", "data": [{"id": _engine.model_path, "object": "model", "owned_by": "gaia"}]})
         elif self.path == "/status":

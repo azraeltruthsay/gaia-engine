@@ -126,6 +126,11 @@ class EngineManager:
         self.model_path = None
         self.device = None
         self.backend = None  # 'engine' or 'gguf'
+        # Set once this process has masked its OWN CUDA (_hide_cuda(os.environ)
+        # for a CPU GGUF load). torch caches device visibility, so from then on
+        # a local torch.cuda.is_available() is False no matter what the GPU is
+        # doing -- the local probe can no longer judge a cuda worker (8xr4.13).
+        self._own_cuda_masked = False
         self.event_callback = event_callback
         self._lock = threading.Lock()
         # Inference queue: limits concurrent requests to the worker.
@@ -176,6 +181,7 @@ class EngineManager:
                     _expose_cuda(os.environ)
                 else:
                     _hide_cuda(os.environ)
+                    self._own_cuda_masked = True
 
                 try:
                     from gaia_engine.cpp import is_available, GaiaCppBackendAdapter
@@ -559,7 +565,18 @@ class EngineManager:
         """
         data = self._build_health_response()
         device = data.get("device")
-        if device == "cuda":
+        if device == "cuda" and "cuda_healthy" in data:
+            # The worker probed CUDA in the process that actually holds the
+            # GPU context -- its verdict outranks anything we can see here.
+            if data["cuda_healthy"] is False:
+                data["status"] = "degraded"
+        elif device == "cuda" and self._own_cuda_masked:
+            # No worker verdict (llama-server worker, or proxy skipped during
+            # active inference) and our own view is masked: unverifiable, not
+            # dead. Don't degrade on a probe we know is blind (8xr4.13).
+            data["cuda_healthy"] = None
+            data["cuda_detail"] = "unverified: manager CUDA masked by an earlier CPU load"
+        elif device == "cuda":
             try:
                 from gaia_engine.core import cuda_health_snapshot
                 cuda_ok, cuda_detail = cuda_health_snapshot(device)

@@ -1069,27 +1069,12 @@ class GAIAEngine:
         self.prefix_cache = PrefixCache(self.model, self.tokenizer, device,
                                         formatter=self.formatter)
 
-        # Load behavioral cache examples if available
-        _behavioral_path = os.path.join(
-            os.environ.get("KNOWLEDGE_DIR", "/knowledge"),
-            "system_reference", "behavioral_cache.json"
-        )
-        try:
-            if os.path.isfile(_behavioral_path):
-                import json as _json_bc
-                with open(_behavioral_path) as _f:
-                    _bc = _json_bc.load(_f)
-                _examples = _bc.get("examples", [])
-                if _examples:
-                    _lines = []
-                    for ex in _examples:
-                        _lines.append(f"[Example: {ex.get('context', '')}]")
-                        _lines.append(f"User: {ex['user']}")
-                        _lines.append(f"Assistant: {ex['assistant']}")
-                    self.prefix_cache.update_segment("behavioral", "\n".join(_lines))
-                    logger.info("Behavioral cache loaded: %d examples from %s", len(_examples), _behavioral_path)
-        except Exception as _bc_exc:
-            logger.debug("Behavioral cache not loaded: %s", _bc_exc)
+        # The "behavioral" segment is the consumer's to fill (POST /cache/update,
+        # e.g. gaia-core's Samvega fold). The engine used to seed it from
+        # /knowledge/system_reference/behavioral_cache.json, which put six fixed
+        # few-shots into the system prompt of every full-mode request: "How are
+        # you feeling?" got "What's the current system health?", Arthur turns
+        # got the Lewis Carroll riddle (GAIA_Project-8xr4.24).
 
         # ── Persistent KV Prefix: load from disk if available ──
         # Avoids reprocessing the system prompt on every restart.
@@ -1818,6 +1803,9 @@ class GAIAEngine:
                 prefix_len = 0
                 if system:
                     self.prefix_cache.update_segment("identity", system)
+                    # Slim mode's few-shot turns are its own; a full-mode caller
+                    # sends its whole prompt (8xr4.24).
+                    self.prefix_cache.update_segment("tools", "")
 
                     if self.awareness:
                         user_text = " ".join(m.get("content", "") for m in conversation)

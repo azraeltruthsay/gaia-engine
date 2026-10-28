@@ -47,6 +47,25 @@ torch.set_grad_enabled(False)
 
 # ── Activation JSONL Writer ──────────────────────────────────────────────────
 
+# Size-based rotation: the stream had grown to 1GB, and graph decode (uapv)
+# writes ~4x faster. Past the cap the file is renamed to <path>.1 (replacing
+# the previous one), so at most two caps' worth stays on disk. gaia-web's tail
+# already handles this: it restarts from the top when the file shrinks.
+_ACTIVATION_STREAM_MAX_BYTES = int(float(os.environ.get("ACTIVATION_STREAM_MAX_MB", "256")) * 2 ** 20)
+
+
+def _rotate_activation_stream(path: str, max_bytes: int = None) -> bool:
+    """Rename `path` to `path.1` once it reaches `max_bytes`; True if rotated."""
+    limit = _ACTIVATION_STREAM_MAX_BYTES if max_bytes is None else max_bytes
+    try:
+        if limit > 0 and os.path.getsize(path) >= limit:
+            os.replace(path, path + ".1")
+            return True
+    except OSError:
+        pass  # missing file, or another writer rotated it first
+    return False
+
+
 def _write_activation(tier, token, token_idx, session_id, snapshot, sae=None, labels=None):
     """Write per-token activation data to JSONL for live visualization.
 
@@ -99,6 +118,7 @@ def _write_activation(tier, token, token_idx, session_id, snapshot, sae=None, la
     try:
         from gaia_engine.config import ACTIVATION_STREAM_PATH
         log_path = ACTIVATION_STREAM_PATH
+        _rotate_activation_stream(log_path)
         with open(log_path, "a") as f:
             f.write(line + "\n")
     except Exception:
@@ -778,10 +798,12 @@ class PrefixCache:
 # not growing with position).
 
 GRAPH_DECODE_ENABLED = os.environ.get("GAIA_CUDA_GRAPHS", "1").lower() not in ("0", "false", "no", "off")
-# Architectures whose decode step was checked token-for-token against the
-# dynamic cache. Others (e.g. Qwen3-VL's multimodal rotary positions, which
-# carry host-side state) keep the dynamic-cache loop until checked.
-_GRAPH_VERIFIED_MODEL_TYPES = {"gemma4", "gemma4_text"}
+# Architectures whose decode step was checked against the dynamic cache
+# (teacher-forced logits: top-1 ~99%, KL ~1e-3; temperature-0 output equal).
+# Qwen3-VL (Prime, p3on): text-only decode passes explicit positions, so its
+# cached multimodal rope_deltas never enter the step. Others keep the
+# dynamic-cache loop until checked.
+_GRAPH_VERIFIED_MODEL_TYPES = {"gemma4", "gemma4_text", "qwen3_vl", "qwen3_vl_text"}
 _GRAPH_MIN_LEN = 2048       # static buffers come in powers of two from here
 _GRAPH_VRAM_MARGIN_MB = 768  # left free after the buffers (WSL reports OOM as a driver fault)
 
@@ -910,7 +932,10 @@ class _GraphDecoder:
         return out.logits[:, -1, :]
 
     def _forward(self, hidden: bool):
-        out = self.model(self._tok, past_key_values=self.kv, use_cache=True, attention_mask=self._masks,
+        # Gemma 4 takes a {layer type: mask} mapping; single-type models
+        # (Qwen3-VL) take one 4-D mask, which transformers uses as given.
+        masks = self._masks if len(self._masks) > 1 else next(iter(self._masks.values()))
+        out = self.model(self._tok, past_key_values=self.kv, use_cache=True, attention_mask=masks,
                          cache_position=self._cache_pos, position_ids=self._cache_pos.view(1, 1),
                          output_hidden_states=hidden)
         return out.logits[:, -1, :], (out.hidden_states if hidden else None)

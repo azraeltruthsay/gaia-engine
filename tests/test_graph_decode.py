@@ -34,7 +34,7 @@ def test_cpu_engine_never_uses_graphs():
 
 
 def test_unverified_architecture_keeps_dynamic_loop():
-    assert GAIAEngine._graph_decoder_for(_engine(model_type="qwen3_vl"), 1000) is None
+    assert GAIAEngine._graph_decoder_for(_engine(model_type="llama"), 1000) is None
 
 
 def test_disabled_after_a_failure_stays_disabled():

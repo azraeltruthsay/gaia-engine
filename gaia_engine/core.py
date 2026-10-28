@@ -324,6 +324,37 @@ def _collapse_repeated_lines(text: str) -> str:
     return '\n'.join(out)
 
 
+# Stop strings (OpenAI/vLLM `stop` / `include_stop_str_in_output`, ecnc).
+# The token loops check the decoded tail of the generation each step; this
+# many tokens covers any reasonable stop string ("</tool_call>" is ~5).
+# manager.py keeps its own copy of the cut (_apply_stop): it is stdlib-only
+# and must not import this module (torch).
+_STOP_TAIL_TOKENS = 24
+
+
+def _normalize_stop(stop) -> list:
+    """`stop` as a list of non-empty strings (OpenAI accepts str or list)."""
+    if not stop:
+        return []
+    if isinstance(stop, str):
+        stop = [stop]
+    return [s for s in stop if isinstance(s, str) and s]
+
+
+def _cut_at_stop(text: str, stops: list, include: bool):
+    """(text cut at the earliest stop string, whether one was found).
+    `include` keeps the stop string (vLLM include_stop_str_in_output)."""
+    best = None
+    for s_ in stops:
+        i = text.find(s_)
+        if i >= 0 and (best is None or i < best[0]):
+            best = (i, s_)
+    if best is None:
+        return text, False
+    i, s_ = best
+    return text[:i + (len(s_) if include else 0)], True
+
+
 def _clean_response_text(text: str) -> str:
     """Strip trailing chat-template artifacts from a generated response.
 
@@ -1589,7 +1620,8 @@ class GAIAEngine:
                  temperature: float = 0.7, top_p: float = 0.9,
                  skip_prefix: bool = False,
                  enable_thinking: bool = True,
-                 repetition_penalty: float = 1.1) -> dict:
+                 repetition_penalty: float = 1.1,
+                 stop=None, include_stop_str_in_output: bool = False) -> dict:
         """Generate a chat completion with full introspection.
 
         Args:
@@ -1605,7 +1637,13 @@ class GAIAEngine:
                 with V11 adapter (GAIA_Project-0xw) without distorting
                 the natural-language distribution. Set to 1.0 to
                 disable.
+            stop: string or list of strings; generation ends at the first
+                one (OpenAI/vLLM semantics: excluded from the text unless
+                include_stop_str_in_output). gaia-core stops Core at
+                "</tool_call>" — everything after is waste, often a made-up
+                <tool_result> (ecnc).
         """
+        _stops = _normalize_stop(stop)
         with self._lock:
             # Fail fast on a dead CUDA context (GAIA_Project-448j/t0f2) instead
             # of crashing many frames deep inside audio/vision/text generation —
@@ -1656,6 +1694,8 @@ class GAIAEngine:
 
                 generated_ids = output_ids[0][input_ids.shape[1]:]
                 text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+                if _stops:  # model.generate() can't stop on strings; cut after
+                    text, _ = _cut_at_stop(text, _stops, include_stop_str_in_output)
                 if self._active_adapter is None:
                     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
 
@@ -1704,6 +1744,8 @@ class GAIAEngine:
                 # Decode only generated tokens
                 generated_ids = output_ids[0][input_ids.shape[1]:]
                 text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+                if _stops:  # model.generate() can't stop on strings; cut after
+                    text, _ = _cut_at_stop(text, _stops, include_stop_str_in_output)
                 # Preserve <think>...</think> when an adapter is active —
                 # adapter-driven deliberation depends on the thinking trace
                 # being visible to downstream parsers. For base-model
@@ -1890,6 +1932,7 @@ class GAIAEngine:
             _eos_only = {self.formatter.eos_token_id}  # always stop immediately
             _soft_stop = _stop_ids - _eos_only  # stop after min tokens (e.g. <turn|>)
             _MIN_TOKENS_BEFORE_SOFT_STOP = 3
+            _stopped = False  # ended on a `stop` string
             _entropy_sum = 0.0
             _entropy_count = 0
             # Apply repetition penalty over a sliding window of recent
@@ -1951,6 +1994,10 @@ class GAIAEngine:
                 if token in _soft_stop and step >= _MIN_TOKENS_BEFORE_SOFT_STOP:
                     break
                 generated.append(token)
+                if _stops and any(s_ in self.tokenizer.decode(
+                        generated[-_STOP_TAIL_TOKENS:], skip_special_tokens=True) for s_ in _stops):
+                    _stopped = True
+                    break
                 # Slide the repetition-penalty window forward
                 _rep_window_set.add(token)
                 if len(generated) > _REP_WINDOW:
@@ -1979,6 +2026,8 @@ class GAIAEngine:
 
             # Decode
             text = self.tokenizer.decode(generated, skip_special_tokens=True)
+            if _stops:
+                text, _ = _cut_at_stop(text, _stops, include_stop_str_in_output)
             # Preserve <think>...</think> when an adapter is active so
             # adapter-driven deliberation traces reach the caller's parser
             # intact. Strip for base-model inference to keep responses tidy.
@@ -2030,7 +2079,7 @@ class GAIAEngine:
                 "created": int(time.time()),
                 "model": self.model_path,
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": _clean_response_text(text)},
-                             "finish_reason": "stop" if len(generated) < max_tokens else "length"}],
+                             "finish_reason": "stop" if _stopped or len(generated) < max_tokens else "length"}],
                 "usage": {
                     "prompt_tokens": total_input,
                     "completion_tokens": len(generated),
@@ -2042,7 +2091,8 @@ class GAIAEngine:
 
     def generate_stream(self, messages: list, max_tokens: int = 512,
                          temperature: float = 0.7, top_p: float = 0.9,
-                         session_id: str = ""):
+                         session_id: str = "", stop=None,
+                         include_stop_str_in_output: bool = False):
         """Generate a chat completion with per-token streaming.
 
         Yields dicts with delta content for each token, compatible with
@@ -2051,7 +2101,13 @@ class GAIAEngine:
         When the activation monitor is enabled, also writes per-token
         activation snapshots to ``/logs/activation_stream.jsonl`` for
         the Neural Mind Map visualization.
+
+        `stop` / `include_stop_str_in_output`: as in generate(). Text that
+        could be the start of a stop string is held back until it can't
+        be, so an excluded stop string never reaches the client.
         """
+        _stops = _normalize_stop(stop)
+        _holdback = max((len(s_) for s_ in _stops), default=1) - 1
         # Reuse the same setup as generate() — build input_ids and KV cache
         # This is a simplified version that skips prefix cache for streaming
         with self._lock:
@@ -2070,7 +2126,9 @@ class GAIAEngine:
                 self._lock.release()
                 try:
                     result = self.generate(messages, max_tokens=max_tokens,
-                                           temperature=temperature, top_p=top_p)
+                                           temperature=temperature, top_p=top_p,
+                                           stop=_stops,
+                                           include_stop_str_in_output=include_stop_str_in_output)
                 finally:
                     self._lock.acquire()
 
@@ -2179,6 +2237,17 @@ class GAIAEngine:
 
                 # Decode incrementally — get the new text added by this token
                 full_text = self.tokenizer.decode(generated, skip_special_tokens=True)
+                if _stops:
+                    cut, _hit = _cut_at_stop(full_text, _stops, include_stop_str_in_output)
+                    if _hit:
+                        if cut[len(prev_text):]:
+                            yield {"id": gen_id,
+                                   "choices": [{"delta": {"content": cut[len(prev_text):]},
+                                                "finish_reason": None}]}
+                        prev_text = cut
+                        break
+                    # Hold back what could still become a stop string.
+                    full_text = full_text[:max(len(prev_text), len(full_text) - _holdback)]
                 delta = full_text[len(prev_text):]
                 prev_text = full_text
 
@@ -2204,6 +2273,16 @@ class GAIAEngine:
                                           step + 1, session_id,
                                           snapshot, self._sae_atlas, self._sae_labels)
                 del out  # Free output each step
+
+            if _stops:
+                # Flush what was held back (generation ended without a stop).
+                final_text = self.tokenizer.decode(generated, skip_special_tokens=True)
+                final_text, _ = _cut_at_stop(final_text, _stops, include_stop_str_in_output)
+                if len(final_text) > len(prev_text) and final_text.startswith(prev_text):
+                    yield {"id": gen_id,
+                           "choices": [{"delta": {"content": final_text[len(prev_text):]},
+                                        "finish_reason": None}]}
+                    prev_text = final_text
 
             self._request_count += 1
             self._total_tokens += len(generated)
@@ -2524,7 +2603,9 @@ class EngineHandler(BaseHTTPRequestHandler):
 
                     for chunk in _engine.generate_stream(
                         b.get("messages", []), b.get("max_tokens", 512),
-                        b.get("temperature", 0.7), b.get("top_p", 0.9)):
+                        b.get("temperature", 0.7), b.get("top_p", 0.9),
+                        stop=b.get("stop"),
+                        include_stop_str_in_output=bool(b.get("include_stop_str_in_output"))):
                         self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
                         self.wfile.flush()
                     self.wfile.write(b"data: [DONE]\n\n")
@@ -2545,7 +2626,9 @@ class EngineHandler(BaseHTTPRequestHandler):
                         b.get("temperature", 0.7), b.get("top_p", 0.9),
                         skip_prefix=b.get("skip_prefix", False),
                         enable_thinking=_template_kwargs.get("enable_thinking", True),
-                        repetition_penalty=float(_rep_pen))
+                        repetition_penalty=float(_rep_pen),
+                        stop=b.get("stop"),
+                        include_stop_str_in_output=bool(b.get("include_stop_str_in_output")))
                     self._json(result)
             except GPUUnavailableError as e:
                 # Distinct from a normal generation error (500) so the

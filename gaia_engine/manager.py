@@ -33,11 +33,25 @@ import sys
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
 from socketserver import ThreadingMixIn
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
 logger = logging.getLogger("GAIA.EngineManager")
+
+def _apply_stop(text: str, stop, include: bool) -> str:
+    """Cut `text` at the earliest `stop` string (str or list; OpenAI/vLLM
+    semantics, kept only with `include`). For backends that can't stop on
+    strings (gaia_cpp). Mirrors core._cut_at_stop — this module stays
+    stdlib-only, so it can't import core (torch)."""
+    stops = [stop] if isinstance(stop, str) else [s for s in (stop or []) if isinstance(s, str) and s]
+    hits = [(text.find(s), s) for s in stops if s and text.find(s) >= 0]
+    if not hits:
+        return text
+    i, s = min(hits)
+    return text[:i + (len(s) if include else 0)]
+
 
 # Requests that should NOT be proxied but handled by the manager directly
 _MANAGER_PATHS = {"/model/load", "/model/unload", "/model/swap", "/health", "/status", "/model/info",
@@ -855,6 +869,16 @@ class EngineManager:
                     messages, max_tokens, temperature, top_p,
                     enable_thinking=enable_thinking,
                 )
+                # gaia_cpp can't stop on strings; honour `stop` afterwards
+                # so callers get the same text as from the torch worker.
+                if req_data.get("stop"):
+                    try:
+                        _msg = result["choices"][0]["message"]
+                        _msg["content"] = _apply_stop(
+                            _msg.get("content") or "", req_data["stop"],
+                            bool(req_data.get("include_stop_str_in_output")))
+                    except (KeyError, IndexError, TypeError):
+                        logger.debug("cpp result had no message to apply stop to")
                 return (200, ct, json.dumps(result).encode())
             except Exception as e:
                 return (500, ct, json.dumps({"error": str(e)}).encode())

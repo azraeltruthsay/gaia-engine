@@ -168,6 +168,27 @@ class GaiaCppBackendAdapter:
         self._request_lock = threading.Lock()  # single active request guard
         self._lora_path: Optional[str] = None
 
+        # d12t: KV reuse between requests (prefix reuse + in-memory
+        # snapshots). GAIA_CPP_PREFIX_REUSE=0 restores the old stateless
+        # behaviour; GAIA_CPP_KV_SNAPSHOTS sets the snapshot slots;
+        # GAIA_CPP_KV_BASELINE names a saved state to load at start.
+        self._kv_control = hasattr(self._backend, "kv_stats")  # older .so: no KV API
+        if self._kv_control:
+            reuse = os.environ.get("GAIA_CPP_PREFIX_REUSE", "1") != "0"
+            self._backend.set_prefix_reuse(reuse)
+            self._backend.set_snapshot_slots(int(os.environ.get("GAIA_CPP_KV_SNAPSHOTS", "2")))
+            baseline = os.environ.get("GAIA_CPP_KV_BASELINE", "")
+            if reuse and baseline and os.path.exists(baseline):
+                n = self._backend.load_state(baseline)
+                if n:
+                    logger.info("gaia_cpp: KV baseline loaded from %s (%d tokens)", baseline, n)
+                else:
+                    logger.warning("gaia_cpp: could not load KV baseline %s; starting cold", baseline)
+            logger.info("gaia_cpp: prefix reuse %s, %d snapshot slot(s)",
+                        "on" if reuse else "off", self._backend.kv_stats()["snapshot_slots"])
+        else:
+            logger.info("gaia_cpp: extension predates KV control (d12t); every request reads its full prompt")
+
     # ── Health ────────────────────────────────────────────────────────────────
 
     def health(self) -> dict:
@@ -182,7 +203,57 @@ class GaiaCppBackendAdapter:
             "tier":      self.tier,
             "lora_active": self._backend.active_adapter_count(),
             "lora_path":   self._lora_path,
+            "kv":          self.kv_stats(),
         }
+
+    # ── KV cache control (d12t) ───────────────────────────────────────────────
+
+    def kv_stats(self) -> dict:
+        """Prefix-reuse / snapshot counters, or {} on an older extension."""
+        if not self._kv_control:
+            return {}
+        try:
+            return dict(self._backend.kv_stats())
+        except Exception as e:  # never fail /health over stats
+            logger.debug("kv_stats failed: %s", e)
+            return {"error": str(e)}
+
+    def clear_kv(self) -> bool:
+        if not self._kv_control:
+            return False
+        with self._request_lock:
+            self._backend.clear_kv()
+        logger.info("gaia_cpp: KV cache and snapshots cleared")
+        return True
+
+    def save_kv(self, path: str) -> int:
+        """Save the live KV (last prompt + reply) to `path`; tokens saved."""
+        if not self._kv_control:
+            return 0
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with self._request_lock:
+            n = self._backend.save_state(path)
+        logger.info("gaia_cpp: KV state saved to %s (%d tokens)", path, n)
+        return n
+
+    def load_kv(self, path: str) -> int:
+        """Load a saved KV state as the live cache and a pinned baseline."""
+        if not self._kv_control or not os.path.exists(path):
+            return 0
+        with self._request_lock:
+            n = self._backend.load_state(path)
+        if n:
+            logger.info("gaia_cpp: KV state loaded from %s (%d tokens)", path, n)
+        else:
+            logger.warning("gaia_cpp: KV state %s did not load", path)
+        return n
+
+    def _log_reuse(self, result) -> None:
+        if self._kv_control and result.prompt_tokens:
+            logger.debug("gaia_cpp: prompt %d tok — %d reused%s, %d evaluated",
+                         result.prompt_tokens, result.reused_tokens,
+                         " (snapshot)" if result.snapshot_restored else "",
+                         result.evaluated_tokens)
 
     # ── Streaming generation ──────────────────────────────────────────────────
 
@@ -227,6 +298,7 @@ class GaiaCppBackendAdapter:
                 0,      # top_k
                 bool(self.capture_layers),
             )
+        self._log_reuse(result)
 
         # Write activation log from final result (hidden states of last token)
         if result.hidden_states:
@@ -295,6 +367,7 @@ class GaiaCppBackendAdapter:
                 prompt, max_tokens, temperature, top_p, 0,
                 bool(self.capture_layers),
             )
+        self._log_reuse(result)
 
         # Strip <think> blocks from output (Qwen3 defaults to thinking mode)
         # Handles both closed <think>...</think> and unclosed <think>... (hit max_tokens)
@@ -314,6 +387,7 @@ class GaiaCppBackendAdapter:
             "usage": {
                 "prompt_tokens":     result.prompt_tokens,
                 "completion_tokens": result.completion_tokens,
+                **({"cached_prefix_tokens": result.reused_tokens} if self._kv_control else {}),
             },
         }
 

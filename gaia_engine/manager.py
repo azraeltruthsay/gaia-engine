@@ -888,6 +888,29 @@ class EngineManager:
         #   cpp native: {"adapter_path": "/path/to/adapter.gguf", "scale": 1.0}
         #   unified:    {"name": "adapter_name", "path": "/path/to/adapter/dir"}
         #               (auto-finds adapter.gguf in the directory)
+        # ── KV cache control (d12t) ─────────────────────────────────────────
+        # GET /kv/stats · POST /kv/clear · POST /kv/save {"name"} · POST
+        # /kv/load {"name"}. States live under GAIA_CPP_KV_DIR as
+        # <name>.kvstate; a bare name (no path) keeps writes in that dir.
+        if path.startswith("/kv/"):
+            try:
+                if path == "/kv/stats":
+                    return (200, ct, json.dumps(cpp.kv_stats()).encode())
+                if path == "/kv/clear" and method == "POST":
+                    return (200, ct, json.dumps({"ok": cpp.clear_kv()}).encode())
+                if path in ("/kv/save", "/kv/load") and method == "POST":
+                    name = str((json.loads(body) if body else {}).get("name", "baseline"))
+                    if not name or "/" in name or name.startswith(".") or ".." in name:
+                        return (400, ct, json.dumps({"ok": False, "error": "name must be a bare file name"}).encode())
+                    kv_dir = os.environ.get("GAIA_CPP_KV_DIR", "/shared/kv_states")
+                    fpath = os.path.join(kv_dir, f"{name}.kvstate")
+                    n = cpp.save_kv(fpath) if path == "/kv/save" else cpp.load_kv(fpath)
+                    return (200, ct, json.dumps({"ok": n > 0, "tokens": n, "path": fpath}).encode())
+                return (404, ct, json.dumps({"error": f"unknown KV endpoint {method} {path}"}).encode())
+            except Exception as e:
+                logger.warning("KV endpoint %s failed: %s", path, e)
+                return (500, ct, json.dumps({"ok": False, "error": str(e)}).encode())
+
         if path == "/adapter/load" and method == "POST" and body:
             try:
                 import os as _os

@@ -17,13 +17,31 @@
 // Thread safety: ONE active generate/generate_stream at a time per instance.
 // manager.py's _inference_semaphore provides the outer guard.
 // The C++ inference_mtx_ catches any internal races.
+//
+// KV reuse (GAIA_Project-d12t): the KV cache is kept between requests.
+// Reading the prompt is the dominant cost on CPU (~155 tok/s vs ~10 tok/s
+// generation, but GAIA prompts are 1.5-3k tokens), and every request used to
+// clear the cache and read its whole prompt again. Now:
+//   - prefix reuse: only the tokens after the longest common prefix with
+//     what is already in the KV are evaluated;
+//   - snapshots: after an expensive prompt read, the KV state is copied
+//     into a small in-memory set (LRU; a loaded baseline is pinned). A
+//     request that shares more with a snapshot than with the live cache
+//     restores it first, so callers that alternate between different
+//     prompts don't evict each other's prefix;
+//   - save_state/load_state persist the live KV to disk, so a baseline
+//     (e.g. a system prompt) survives a restart.
+// The cache is dropped whenever it could be stale: LoRA changes, decode
+// errors, and requests that capture every prompt token's hidden state.
 
 #include <pybind11/pybind11.h>
 #include <pybind11/functional.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <functional>
 #include <mutex>
@@ -46,6 +64,11 @@ struct GenerateResult {
     std::string text;
     int prompt_tokens = 0;
     int completion_tokens = 0;
+    // d12t: how the prompt was read — tokens taken from the KV cache vs
+    // evaluated now, and whether a snapshot was restored to get them.
+    int reused_tokens = 0;
+    int evaluated_tokens = 0;
+    bool snapshot_restored = false;
     // {layer_idx → raw float vector}, converted to numpy after GIL re-acquisition
     std::unordered_map<int, std::vector<float>> hidden_states;
 };
@@ -157,6 +180,7 @@ public:
 
     bool load_lora(const std::string& path, float scale) {
         std::lock_guard<std::mutex> lock(inference_mtx_);
+        _invalidate_kv();  // cached KV was computed with the old adapters
 
         llama_adapter_lora* adapter = llama_adapter_lora_init(model_, path.c_str());
         if (!adapter) {
@@ -190,12 +214,90 @@ public:
 
     void clear_lora() {
         std::lock_guard<std::mutex> lock(inference_mtx_);
+        _invalidate_kv();
 
         // Detach all adapters from context
         llama_set_adapters_lora(ctx_, nullptr, 0, nullptr);
         lora_adapters_.clear();
         lora_scales_.clear();
         // Adapters freed automatically with model (b8250+)
+    }
+
+    // ── KV cache control (d12t) ─────────────────────────────────────────────
+
+    void set_prefix_reuse(bool enabled) {
+        std::lock_guard<std::mutex> lock(inference_mtx_);
+        prefix_reuse_ = enabled;
+        if (!enabled) _invalidate_kv();
+    }
+
+    // Number of unpinned in-memory snapshots kept (0 disables them). A
+    // snapshot holds the full KV for its prompt: ~144 KB/token for an 8B
+    // model with 36 layers and 8 KV heads, so ~430 MB at 3k tokens.
+    void set_snapshot_slots(int n) {
+        std::lock_guard<std::mutex> lock(inference_mtx_);
+        snapshot_slots_ = std::max(0, n);
+        _evict_snapshots();
+    }
+
+    void clear_kv() {
+        std::lock_guard<std::mutex> lock(inference_mtx_);
+        _invalidate_kv();
+    }
+
+    // Persist the live KV (the last request's prompt + reply) to `path`.
+    // Returns the number of tokens saved (0 = nothing to save / failed).
+    int save_state(const std::string& path) {
+        std::lock_guard<std::mutex> lock(inference_mtx_);
+        if (kv_tokens_.empty()) return 0;
+        size_t n = llama_state_seq_save_file(ctx_, path.c_str(), 0,
+                                             kv_tokens_.data(), kv_tokens_.size());
+        return n > 0 ? static_cast<int>(kv_tokens_.size()) : 0;
+    }
+
+    // Load a state saved by save_state() into the live KV, and keep it as a
+    // pinned snapshot (never evicted) so later requests can build on it.
+    // Returns the number of tokens loaded (0 = failed; the cache is then empty).
+    int load_state(const std::string& path) {
+        std::lock_guard<std::mutex> lock(inference_mtx_);
+        _invalidate_kv();
+        std::vector<llama_token> toks(static_cast<size_t>(llama_n_ctx(ctx_)));
+        size_t n_tok = 0;
+        size_t n = llama_state_seq_load_file(ctx_, path.c_str(), 0,
+                                             toks.data(), toks.size(), &n_tok);
+        if (n == 0 || n_tok == 0) {
+            llama_memory_clear(llama_get_memory(ctx_), true);
+            return 0;
+        }
+        toks.resize(n_tok);
+        kv_tokens_ = toks;
+        _take_snapshot(/*pinned=*/true);
+        return static_cast<int>(n_tok);
+    }
+
+    py::dict kv_stats() {
+        std::lock_guard<std::mutex> lock(inference_mtx_);
+        py::dict d;
+        d["prefix_reuse"] = prefix_reuse_;
+        d["cached_tokens"] = static_cast<int>(kv_tokens_.size());
+        d["snapshot_slots"] = snapshot_slots_;
+        py::list snaps;
+        size_t bytes = 0;
+        for (const auto& sn : snapshots_) {
+            py::dict e;
+            e["tokens"] = static_cast<int>(sn.tokens.size());
+            e["bytes"] = static_cast<long long>(sn.data.size());
+            e["pinned"] = sn.pinned;
+            snaps.append(e);
+            bytes += sn.data.size();
+        }
+        d["snapshots"] = snaps;
+        d["snapshot_bytes"] = static_cast<long long>(bytes);
+        d["requests"] = stat_requests_;
+        d["reused_tokens_total"] = stat_reused_;
+        d["evaluated_tokens_total"] = stat_evaluated_;
+        d["snapshot_restores"] = stat_restores_;
+        return d;
     }
 
     // List active adapter count (for health/status reporting)
@@ -240,6 +342,109 @@ private:
     std::mutex inference_mtx_;
     std::vector<llama_adapter_lora*> lora_adapters_;
     std::vector<float> lora_scales_;
+
+    // ── KV reuse state (d12t) ─────────────────────────────────────────────
+    struct KvSnapshot {
+        std::vector<llama_token> tokens;  // what the saved KV holds
+        std::vector<uint8_t> data;        // llama_state_seq_get_data blob
+        bool pinned = false;              // loaded baseline: never evicted
+        uint64_t last_used = 0;
+    };
+    // Snapshot only prompt reads at least this long: shorter ones are cheap
+    // to redo (~0.4 s on CPU) and not worth the memory.
+    static constexpr size_t kMinSnapshotTokens = 256;
+    // A snapshot replaces the live cache only if it saves this many more
+    // tokens of reading than the live cache does (restoring costs a copy).
+    static constexpr size_t kMinRestoreGain = 64;
+
+    bool prefix_reuse_ = true;
+    int snapshot_slots_ = 2;
+    std::vector<llama_token> kv_tokens_;  // tokens currently in seq 0's KV
+    std::vector<KvSnapshot> snapshots_;
+    uint64_t use_clock_ = 0;
+    long long stat_requests_ = 0, stat_reused_ = 0, stat_evaluated_ = 0, stat_restores_ = 0;
+
+    static size_t _common_prefix(const std::vector<llama_token>& a, const std::vector<llama_token>& b) {
+        size_t n = std::min(a.size(), b.size()), i = 0;
+        while (i < n && a[i] == b[i]) ++i;
+        return i;
+    }
+
+    void _invalidate_kv() {
+        llama_memory_clear(llama_get_memory(ctx_), true);
+        kv_tokens_.clear();
+        snapshots_.clear();
+    }
+
+    // Copy the live KV into a snapshot (replacing one for the same tokens).
+    void _take_snapshot(bool pinned) {
+        if (kv_tokens_.empty() || (!pinned && snapshot_slots_ <= 0)) return;
+        size_t size = llama_state_seq_get_size(ctx_, 0);
+        if (size == 0) return;
+        KvSnapshot sn;
+        sn.tokens = kv_tokens_;
+        sn.data.resize(size);
+        if (llama_state_seq_get_data(ctx_, sn.data.data(), size, 0) == 0) return;
+        sn.pinned = pinned;
+        sn.last_used = ++use_clock_;
+        snapshots_.erase(std::remove_if(snapshots_.begin(), snapshots_.end(),
+            [&](const KvSnapshot& o) { return o.tokens == sn.tokens; }), snapshots_.end());
+        snapshots_.push_back(std::move(sn));
+        _evict_snapshots();
+    }
+
+    // Keep at most snapshot_slots_ unpinned snapshots, least recently used out.
+    void _evict_snapshots() {
+        for (;;) {
+            int unpinned = 0;
+            for (const auto& s : snapshots_) unpinned += !s.pinned;
+            if (unpinned <= snapshot_slots_) return;
+            auto victim = snapshots_.end();
+            for (auto it = snapshots_.begin(); it != snapshots_.end(); ++it)
+                if (!it->pinned && (victim == snapshots_.end() || it->last_used < victim->last_used))
+                    victim = it;
+            snapshots_.erase(victim);
+        }
+    }
+
+    // Prepare seq 0's KV for `prompt`: keep (or restore) the longest usable
+    // prefix and drop the rest. Returns how many prompt tokens are already
+    // in the KV; the caller evaluates the remainder.
+    size_t _prepare_kv(const std::vector<llama_token>& prompt, bool& restored) {
+        restored = false;
+        llama_memory_t mem = llama_get_memory(ctx_);
+        size_t reuse = _common_prefix(kv_tokens_, prompt);
+
+        // A snapshot that shares clearly more of this prompt beats the live cache.
+        KvSnapshot* best = nullptr;
+        size_t best_n = reuse;
+        for (auto& sn : snapshots_) {
+            size_t n = _common_prefix(sn.tokens, prompt);
+            if (n > best_n + kMinRestoreGain) { best = &sn; best_n = n; }
+        }
+        if (best) {
+            llama_memory_clear(mem, true);
+            if (llama_state_seq_set_data(ctx_, best->data.data(), best->data.size(), 0) > 0) {
+                kv_tokens_ = best->tokens;
+                best->last_used = ++use_clock_;
+                reuse = best_n;
+                restored = true;
+            } else {
+                kv_tokens_.clear();  // failed restore left nothing usable
+                reuse = 0;
+            }
+        }
+
+        // The last prompt token is always evaluated: its logits pick the
+        // first reply token, and logits aren't part of the cache.
+        if (reuse >= prompt.size()) reuse = prompt.size() - 1;
+        if (reuse < kv_tokens_.size() && !llama_memory_seq_rm(mem, 0, static_cast<llama_pos>(reuse), -1)) {
+            llama_memory_clear(mem, true);  // partial removal unsupported: start over
+            reuse = 0;
+        }
+        kv_tokens_.resize(reuse);
+        return reuse;
+    }
 
     // ── Tokenize ──────────────────────────────────────────────────────────────
     std::vector<llama_token> _tokenize(const std::string& text, bool add_bos) {
@@ -302,14 +507,26 @@ private:
         }
 
         // ── Prompt eval ────────────────────────────────────────────────────
+        // d12t: start from the cached prefix. Capturing every prompt token's
+        // residuals (SAE atlas) needs them all evaluated, so it reads fresh.
+        size_t reuse = 0;
+        bool restored = false;
+        bool full_capture = capture_hidden && capture_state_.all_tokens.load(std::memory_order_acquire);
+        if (prefix_reuse_ && !full_capture) {
+            reuse = _prepare_kv(prompt_tokens, restored);
+        } else {
+            llama_memory_clear(llama_get_memory(ctx_), true);
+            kv_tokens_.clear();
+        }
+
         if (capture_hidden) {
             capture_state_.reset_captures();
             capture_state_.active.store(true, std::memory_order_release);
         }
 
         llama_batch batch = llama_batch_get_one(
-            prompt_tokens.data(),
-            static_cast<int32_t>(prompt_tokens.size())
+            prompt_tokens.data() + reuse,
+            static_cast<int32_t>(prompt_tokens.size() - reuse)
         );
         int ret = llama_decode(ctx_, batch);
 
@@ -318,8 +535,22 @@ private:
         }
 
         if (ret != 0) {
-            llama_memory_clear(llama_get_memory(ctx_), true);
+            _invalidate_kv();
             throw std::runtime_error("llama_decode failed on prompt (ret=" + std::to_string(ret) + ")");
+        }
+        kv_tokens_ = prompt_tokens;
+        result.reused_tokens = static_cast<int>(reuse);
+        result.evaluated_tokens = static_cast<int>(prompt_tokens.size() - reuse);
+        result.snapshot_restored = restored;
+        ++stat_requests_;
+        stat_reused_ += static_cast<long long>(reuse);
+        stat_evaluated_ += result.evaluated_tokens;
+        stat_restores_ += restored;
+        // Keep a baseline of an expensive read so a later prompt sharing it
+        // doesn't pay for it again after another caller has moved the cache.
+        if (prefix_reuse_ && !full_capture
+                && static_cast<size_t>(result.evaluated_tokens) >= kMinSnapshotTokens) {
+            _take_snapshot(/*pinned=*/false);
         }
 
         // ── Autoregressive generation loop ────────────────────────────────
@@ -359,8 +590,12 @@ private:
             }
 
             if (ret != 0) {
-                break;  // context full or error — stop gracefully
+                // Context full or error: stop gracefully, and don't trust the
+                // cache for the next request.
+                _invalidate_kv();
+                break;
             }
+            kv_tokens_.push_back(tok);  // now in the KV: a follow-up can reuse it
         }
 
         llama_sampler_free(sampler);
@@ -376,8 +611,11 @@ private:
             }
         }
 
-        // ── Clear KV cache for next request (stateless mode) ─────────────
-        llama_memory_clear(llama_get_memory(ctx_), true);
+        // d12t: the KV is kept (prompt + reply) for the next request's prefix.
+        if (!prefix_reuse_ || full_capture) {
+            llama_memory_clear(llama_get_memory(ctx_), true);
+            kv_tokens_.clear();
+        }
 
         result.text = std::move(full_text);
         result.completion_tokens = n_generated;
@@ -410,6 +648,9 @@ PYBIND11_MODULE(gaia_cpp, m) {
         .def_readonly("text",              &GenerateResult::text)
         .def_readonly("prompt_tokens",     &GenerateResult::prompt_tokens)
         .def_readonly("completion_tokens", &GenerateResult::completion_tokens)
+        .def_readonly("reused_tokens",     &GenerateResult::reused_tokens)
+        .def_readonly("evaluated_tokens",  &GenerateResult::evaluated_tokens)
+        .def_readonly("snapshot_restored", &GenerateResult::snapshot_restored)
         .def_property_readonly("hidden_states", [](const GenerateResult& r) {
             // Convert raw float vectors → numpy arrays (GIL is held here)
             return _hidden_states_to_numpy(r.hidden_states);
@@ -488,6 +729,15 @@ PYBIND11_MODULE(gaia_cpp, m) {
             py::arg("path"), py::arg("scale") = 1.0f)
         .def("clear_lora", &LlamaCppBackend::clear_lora)
         .def("active_adapter_count", &LlamaCppBackend::active_adapter_count)
+        // d12t: KV cache control
+        .def("set_prefix_reuse",   &LlamaCppBackend::set_prefix_reuse, py::arg("enabled"))
+        .def("set_snapshot_slots", &LlamaCppBackend::set_snapshot_slots, py::arg("n"))
+        .def("clear_kv",           &LlamaCppBackend::clear_kv)
+        .def("save_state",         &LlamaCppBackend::save_state, py::arg("path"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("load_state",         &LlamaCppBackend::load_state, py::arg("path"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("kv_stats",           &LlamaCppBackend::kv_stats)
 
         .def("n_vocab",         &LlamaCppBackend::n_vocab)
         .def("n_embd",          &LlamaCppBackend::n_embd)

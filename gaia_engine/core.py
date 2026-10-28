@@ -755,6 +755,212 @@ class PrefixCache:
         }
 
 
+# ── CUDA-graph decode (uapv) ─────────────────────────────────────────────────
+#
+# One decode step of a 42-layer model is hundreds of small kernels launched from
+# Python; with a LoRA adapter, hundreds more. Measured on the RTX 5080: 15 tok/s
+# with core_thinking_v1 at ~32% GPU utilisation — launch-bound, not compute-
+# bound. Recording the step once as a CUDA graph and replaying it makes it one
+# launch: ~65 tok/s, with hidden states still read every step for the polygraph.
+#
+# A graph replays fixed addresses, so the step may hold no host-side state that
+# changes per token. transformers' sliding-window cache layers do (a Python
+# position drives their mask offset and roll-over), so every layer here is a
+# full-length StaticLayer: keys sit at their true positions and the sliding
+# window is enforced by the mask. The decoder builds the decode-step masks
+# itself (causal, and causal within the sliding window) into static buffers
+# outside the graph: transformers' own mask builders differ across versions and
+# 5.17's creates a tensor from a Python scalar on every call, which can't be
+# recorded. The per-step state — write pointers, position, masks — is all set
+# on-device before each replay. Teacher-forced check against the dynamic
+# cache: the graph is bit-exact to the same static cache run eagerly, and that
+# differs from the dynamic cache only by bf16 rounding (top-1 99%, KL ~1e-3,
+# not growing with position).
+
+GRAPH_DECODE_ENABLED = os.environ.get("GAIA_CUDA_GRAPHS", "1").lower() not in ("0", "false", "no", "off")
+# Architectures whose decode step was checked token-for-token against the
+# dynamic cache. Others (e.g. Qwen3-VL's multimodal rotary positions, which
+# carry host-side state) keep the dynamic-cache loop until checked.
+_GRAPH_VERIFIED_MODEL_TYPES = {"gemma4", "gemma4_text"}
+_GRAPH_MIN_LEN = 2048       # static buffers come in powers of two from here
+_GRAPH_VRAM_MARGIN_MB = 768  # left free after the buffers (WSL reports OOM as a driver fault)
+
+
+def _cfg_attr(config, name, default=None):
+    """Config attribute, or `default` when absent or refused (transformers
+    5.17 raises on a global read of an attribute that varies per layer)."""
+    try:
+        value = getattr(config, name)
+    except Exception:
+        return default
+    return default if value is None else value
+
+
+def _static_kv_bytes_per_token(text_config) -> int:
+    """KV bytes per token for the layers that own a cache (bf16 K and V).
+    Head size can differ per layer (Gemma 4: 256 sliding, 512 full)."""
+    types = list(_cfg_attr(text_config, "layer_types", []) or [])
+    n_layers = int(_cfg_attr(text_config, "num_hidden_layers", len(types)))
+    n_owned = n_layers - int(_cfg_attr(text_config, "num_kv_shared_layers", 0))
+    per_layer = _cfg_attr(text_config, "per_layer_config")
+    heads = int(_cfg_attr(text_config, "num_key_value_heads", 1))
+    head_dim = int(_cfg_attr(text_config, "head_dim", 128))
+    global_dim = int(_cfg_attr(text_config, "global_head_dim", head_dim))
+    total = 0
+    for i in range(n_owned):
+        if per_layer is not None:
+            layer_heads = int(_cfg_attr(per_layer[i], "num_key_value_heads", heads))
+            dim = int(_cfg_attr(per_layer[i], "head_dim", head_dim))
+        else:
+            layer_heads = heads
+            dim = global_dim if (i < len(types) and types[i] == "full_attention") else head_dim
+        total += 2 * layer_heads * dim * 2
+    return total
+
+
+class _DecodeOut:
+    """What the decode loops read from a step's output on the graph path."""
+    __slots__ = ("hidden_states",)
+
+    def __init__(self, hidden_states):
+        self.hidden_states = hidden_states
+
+
+class _GraphDecoder:
+    """A static KV cache plus CUDA graphs of the single-token decode step.
+
+    prefill() runs eagerly into the cache (copying any prefix KV in first);
+    step() replays the graph for the current key — (active adapter, whether
+    hidden states are captured) — recording it on first use. Graphs record
+    buffer addresses, not contents, so they all share the one KV buffer. If a
+    capture fails, that key decodes eagerly on the same static cache — slower,
+    never wrong.
+    """
+
+    def __init__(self, model, max_len: int, device):
+        from transformers import StaticCache
+        from transformers.cache_utils import StaticLayer
+        self.model, self.max_len, self.device = model, max_len, device
+        self.kv = StaticCache(config=model.config, max_cache_len=max_len)
+        for i, layer in enumerate(self.kv.layers):
+            if getattr(layer, "is_sliding", False):
+                self.kv.layers[i] = StaticLayer(max_cache_len=max_len)
+        text_config = model.config.get_text_config()
+        self.window = int(_cfg_attr(text_config, "sliding_window", 0) or 0)
+        layer_types = set(_cfg_attr(text_config, "layer_types", []) or ["full_attention"])
+        unknown = layer_types - {"full_attention", "sliding_attention"}
+        if unknown or ("sliding_attention" in layer_types and not self.window):
+            raise ValueError(f"unsupported attention layer types for graph decode: {sorted(unknown) or layer_types}")
+        dtype = model.get_output_embeddings().weight.dtype
+        self._min = torch.finfo(dtype).min
+        self._kv_idx = torch.arange(max_len, device=device).view(1, 1, 1, max_len)
+        self._masks = {t: torch.zeros((1, 1, 1, max_len), dtype=dtype, device=device) for t in layer_types}
+        self.pos = 0
+        self.graphs: dict = {}      # key -> (graph, logits_out, hidden_out)
+        self.failed: set = set()    # keys whose capture failed
+        self._tok = torch.zeros((1, 1), dtype=torch.long, device=device)
+        self._cache_pos = torch.zeros((1,), dtype=torch.long, device=device)
+        self._pointers: list = []
+
+    def drop_graphs(self):
+        """Forget recorded graphs (the model's modules or weights changed)."""
+        self.graphs.clear()
+        self.failed.clear()
+
+    def _set_pos(self, pos: int):
+        """Point the next step at `pos`: cache slot, rotary position, masks."""
+        self._cache_pos.fill_(pos)
+        for p in self._pointers:
+            p.fill_(pos)
+        visible = self._kv_idx <= pos
+        for layer_type, mask in self._masks.items():
+            allowed = visible & (self._kv_idx > pos - self.window) if layer_type == "sliding_attention" else visible
+            mask.fill_(self._min).masked_fill_(allowed, 0.0)
+
+    def _copy_prefix(self, prefix_kv, prefix_len: int):
+        """Place a dynamic prefix cache's keys/values at their true positions.
+        Sliding layers of a dynamic cache keep only the last window of tokens;
+        the earlier slots stay unfilled, and the sliding mask never reads them."""
+        for i, dyn in enumerate(getattr(prefix_kv, "layers", [])):
+            keys, values = getattr(dyn, "keys", None), getattr(dyn, "values", None)
+            if keys is None or not hasattr(keys, "shape") or keys.numel() == 0:
+                continue
+            layer = self.kv.layers[i]
+            if not layer.is_initialized:
+                layer.lazy_initialization(keys[:, :, :1], values[:, :, :1])
+            n = keys.shape[-2]
+            layer.keys[:, :, prefix_len - n:prefix_len].copy_(keys)
+            layer.values[:, :, prefix_len - n:prefix_len].copy_(values)
+            layer.cumulative_length.fill_(prefix_len)
+
+    def prefill(self, input_ids, prefix_kv=None, prefix_len: int = 0):
+        """Eager prompt forward into the static cache; returns last-position logits."""
+        if prefix_kv is not None and prefix_len:
+            self._copy_prefix(prefix_kv, prefix_len)
+        else:
+            prefix_len = 0
+            for layer in self.kv.layers:
+                if getattr(layer, "is_initialized", False):
+                    layer.cumulative_length.fill_(0)
+        n = input_ids.shape[1]
+        out = self.model(input_ids, past_key_values=self.kv, use_cache=True, logits_to_keep=1,
+                         cache_position=torch.arange(prefix_len, prefix_len + n, device=self.device))
+        self.pos = prefix_len + n
+        self._pointers = [layer.cumulative_length for layer in self.kv.layers if getattr(layer, "is_initialized", False)]
+        return out.logits[:, -1, :]
+
+    def _forward(self, hidden: bool):
+        out = self.model(self._tok, past_key_values=self.kv, use_cache=True, attention_mask=self._masks,
+                         cache_position=self._cache_pos, position_ids=self._cache_pos.view(1, 1),
+                         output_hidden_states=hidden)
+        return out.logits[:, -1, :], (out.hidden_states if hidden else None)
+
+    def _capture(self, key):
+        # Warm up on a side stream (allocator + lazy init), then record. Warm-up
+        # writes the real slot `pos` with the real token, which replay rewrites
+        # identically.
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        hidden = key[1]
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                self._set_pos(self.pos)
+                self._forward(hidden)
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        self._set_pos(self.pos)
+        with torch.cuda.graph(graph):
+            logits_out, hidden_out = self._forward(hidden)
+        self.graphs[key] = (graph, logits_out, hidden_out)
+        logger.info("CUDA-graph decode step recorded for %s (static KV %d tokens)", key, self.max_len)
+
+    def step(self, next_id, key):
+        """Feed one token; returns (logits [1, vocab], hidden_states or None).
+        `key` is (active adapter, capture hidden states)."""
+        if self.pos >= self.max_len:
+            raise RuntimeError(f"static KV cache full ({self.max_len} tokens)")
+        self._tok.copy_(next_id.view(1, 1))
+        if key not in self.graphs and key not in self.failed:
+            try:
+                self._capture(key)
+            except Exception as e:
+                # This request finishes eagerly on the static cache; later ones
+                # with this key go back to the dynamic cache, which is faster
+                # than eager attention over the whole static buffer.
+                self.failed.add(key)
+                logger.warning("CUDA-graph capture failed for %s; using the dynamic cache for it from now on: %s",
+                               key, e, exc_info=True)
+        self._set_pos(self.pos)
+        if key in self.graphs:
+            graph, logits_out, hidden_out = self.graphs[key]
+            graph.replay()
+            logits, hidden = logits_out.clone(), hidden_out
+        else:
+            logits, hidden = self._forward(key[1])
+        self.pos += 1
+        return logits, hidden
+
+
 # ── GAIA Engine ──────────────────────────────────────────────────────────────
 
 class GAIAEngine:
@@ -1241,6 +1447,7 @@ class GAIAEngine:
                     # Additional adapter — add to existing PeftModel
                     logger.info("Loading additional adapter '%s' from %s", name, path)
                     self._peft_model.load_adapter(path, adapter_name=name)
+                self._drop_decode_graphs()
 
                 self._adapters[name] = path
                 mem_mb = torch.cuda.memory_allocated() // (1024 * 1024) if self.device == "cuda" else 0
@@ -1262,6 +1469,7 @@ class GAIAEngine:
                     self.set_active_adapter(None)
                 if self._peft_model is not None:
                     self._peft_model.delete_adapter(name)
+                self._drop_decode_graphs()
                 del self._adapters[name]
 
                 # If no adapters left, unwrap back to base model
@@ -1274,6 +1482,55 @@ class GAIAEngine:
             except Exception as e:
                 logger.exception("Failed to unload adapter '%s'", name)
                 return {"ok": False, "error": str(e)}
+
+    # ── CUDA-graph decode (uapv) ─────────────────────────────────────────
+
+    def _graph_decoder_for(self, needed_len: int, key=None):
+        """The static-KV / CUDA-graph decoder for a text request, or None to use
+        the dynamic-cache loop. Reused across requests; grown (never shrunk)
+        when a request needs more room; skipped when VRAM is short or when
+        recording a graph for `key` (active adapter, hidden states) failed."""
+        if not GRAPH_DECODE_ENABLED or self.device != "cuda" or getattr(self, "_graph_disabled", False):
+            return None
+        if getattr(self.model.config, "model_type", None) not in _GRAPH_VERIFIED_MODEL_TYPES:
+            return None
+        gd = getattr(self, "_graph_decoder", None)
+        if gd is not None and key in gd.failed:
+            return None
+        if gd is not None and gd.model is self.model and gd.max_len >= needed_len:
+            return gd
+        length = max(_GRAPH_MIN_LEN, gd.max_len if gd is not None else 0)
+        while length < needed_len:
+            length *= 2
+        self._drop_graph_decoder()
+        try:
+            need_mb = _static_kv_bytes_per_token(self.model.config.get_text_config()) * length / 2 ** 20
+            free_mb = torch.cuda.mem_get_info()[0] / 2 ** 20
+            if free_mb < need_mb + _GRAPH_VRAM_MARGIN_MB:
+                logger.info("CUDA-graph decode skipped: static KV for %d tokens needs %.0fMB, %.0fMB free",
+                            length, need_mb, free_mb)
+                return None
+            self._graph_decoder = _GraphDecoder(self.model, length, self.model.device)
+            logger.info("CUDA-graph decoder: static KV %d tokens (~%.0fMB)", length, need_mb)
+            return self._graph_decoder
+        except Exception as e:
+            self._graph_disabled = True
+            logger.warning("CUDA-graph decode disabled for this process: %s", e)
+            return None
+
+    def _drop_graph_decoder(self):
+        """Release the decoder and its graphs (model swapped, reloaded or resized)."""
+        if getattr(self, "_graph_decoder", None) is not None:
+            self._graph_decoder = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def _drop_decode_graphs(self):
+        """The model's modules or weights changed: recorded graphs are stale."""
+        gd = getattr(self, "_graph_decoder", None)
+        if gd is not None:
+            gd.drop_graphs()
 
     def set_active_adapter(self, name: Optional[str]) -> Dict:
         """Switch to a specific adapter or back to base model.
@@ -1932,11 +2189,23 @@ class GAIAEngine:
             # logits_to_keep=1: only the last position's logits are needed for
             # next-token generation. Computing them for the whole prompt
             # (seq_len × 262k vocab → ~1-1.4GB) OOMs the prefill on a 16GB GPU.
-            out = self.model(input_ids, past_key_values=current_kv,
-                              use_cache=True, output_hidden_states=False,
-                              logits_to_keep=1)
-            current_kv = out.past_key_values
-            logits = out.logits[:, -1, :]
+            # uapv: text requests decode through the static-KV CUDA-graph
+            # decoder when it fits; otherwise the dynamic-cache loop below.
+            _gd = self._graph_decoder_for(total_input + max_tokens + 1, (getattr(self, "_active_adapter", None), capture))
+            out = None
+            if _gd is not None:
+                try:
+                    logits = _gd.prefill(input_ids, past_kv, prefix_len if past_kv is not None else 0)
+                except Exception as e:
+                    logger.warning("CUDA-graph prefill failed; using the dynamic cache: %s", e)
+                    self._drop_graph_decoder()
+                    _gd = None
+            if _gd is None:
+                out = self.model(input_ids, past_key_values=current_kv,
+                                  use_cache=True, output_hidden_states=False,
+                                  logits_to_keep=1)
+                current_kv = out.past_key_values
+                logits = out.logits[:, -1, :]
 
             if capture and hasattr(out, "hidden_states") and out.hidden_states:
                 filtered = self._extract_target_hidden_states(out.hidden_states)
@@ -2033,10 +2302,14 @@ class GAIAEngine:
 
                 # Forward single token — capture hidden states every Nth token
                 _need_hidden = capture and (step % _SAE_STREAM_EVERY_N == 0)
-                out = self.model(next_id, past_key_values=current_kv,
-                                 use_cache=True, output_hidden_states=_need_hidden)
-                current_kv = out.past_key_values
-                logits = out.logits[:, -1, :]
+                if _gd is not None:
+                    logits, _hidden = _gd.step(next_id, (getattr(self, "_active_adapter", None), capture))
+                    out = _DecodeOut(_hidden if _need_hidden else None)
+                else:
+                    out = self.model(next_id, past_key_values=current_kv,
+                                     use_cache=True, output_hidden_states=_need_hidden)
+                    current_kv = out.past_key_values
+                    logits = out.logits[:, -1, :]
 
                 if _need_hidden and hasattr(out, "hidden_states") and out.hidden_states:
                     filtered = self._extract_target_hidden_states(out.hidden_states)
@@ -2218,10 +2491,20 @@ class GAIAEngine:
             # logits_to_keep=1: only the last position's logits are needed for
             # next-token generation. Computing them for the whole prompt
             # (seq_len × 262k vocab → ~1-1.4GB) OOMs the prefill on a 16GB GPU.
-            out = self.model(input_ids, use_cache=True,
-                             output_hidden_states=False, logits_to_keep=1)
-            current_kv = out.past_key_values
-            logits = out.logits[:, -1, :]
+            _gd = self._graph_decoder_for(input_ids.shape[1] + max_tokens + 1, (getattr(self, "_active_adapter", None), _capture))
+            out = None
+            if _gd is not None:
+                try:
+                    logits = _gd.prefill(input_ids)
+                except Exception as e:
+                    logger.warning("CUDA-graph prefill failed; using the dynamic cache: %s", e)
+                    self._drop_graph_decoder()
+                    _gd = None
+            if _gd is None:
+                out = self.model(input_ids, use_cache=True,
+                                 output_hidden_states=False, logits_to_keep=1)
+                current_kv = out.past_key_values
+                logits = out.logits[:, -1, :]
 
             # Capture initial hidden states if monitor enabled
             if _capture and hasattr(out, "hidden_states") and out.hidden_states:
@@ -2288,10 +2571,14 @@ class GAIAEngine:
 
                 # Forward single token — only request hidden states every Nth token
                 _need_hidden = _capture and (step % _SAE_STREAM_EVERY_N == 0)
-                out = self.model(next_id, past_key_values=current_kv,
-                                 use_cache=True, output_hidden_states=_need_hidden)
-                current_kv = out.past_key_values
-                logits = out.logits[:, -1, :]
+                if _gd is not None:
+                    logits, _hidden = _gd.step(next_id, (getattr(self, "_active_adapter", None), _capture))
+                    out = _DecodeOut(_hidden if _need_hidden else None)
+                else:
+                    out = self.model(next_id, past_key_values=current_kv,
+                                     use_cache=True, output_hidden_states=_need_hidden)
+                    current_kv = out.past_key_values
+                    logits = out.logits[:, -1, :]
 
                 # Write activation snapshot for sampled tokens only
                 if _need_hidden and hasattr(out, "hidden_states") and out.hidden_states:
@@ -2333,6 +2620,7 @@ class GAIAEngine:
                 return {"ok": True, "device": self.device, "message": "already there"}
 
             start = time.time()
+            self._drop_graph_decoder()  # its buffers and graphs live on the old device
             if target == "cpu":
                 self.model = self.model.to("cpu")
                 self.prefix_cache.invalidate()
@@ -2361,6 +2649,7 @@ class GAIAEngine:
                 pass
 
             previous_model = self.model_path
+            self._drop_graph_decoder()
 
             # Unload adapters first (PeftModel wraps base model)
             if self._peft_model is not None:

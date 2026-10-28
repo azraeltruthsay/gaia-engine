@@ -368,6 +368,31 @@ def _clean_response_text(text: str) -> str:
     return cleaned.strip()
 
 
+def _split_thought_tokens(tokenizer, generated: list):
+    """Separate Gemma 4's native thought channel from the answer.
+
+    With <|think|> at the top of the system turn, Gemma 4 writes
+    <|channel>thought\n...<channel|> before its answer. Decoding with
+    skip_special_tokens drops the two markers and runs the thought into the
+    answer, so split by token id first (h1ok). Returns (thought, answer_ids):
+    thought is None when there is no channel; a channel cut off before
+    <channel|> is all thought and leaves no answer.
+    """
+    try:
+        open_id = tokenizer.convert_tokens_to_ids("<|channel>")
+        close_id = tokenizer.convert_tokens_to_ids("<channel|>")
+    except Exception:
+        return None, generated
+    unk = getattr(tokenizer, "unk_token_id", None)
+    if open_id in (None, unk) or close_id in (None, unk) or open_id not in generated:
+        return None, generated
+    start = generated.index(open_id) + 1
+    end = generated.index(close_id, start) if close_id in generated[start:] else len(generated)
+    thought = tokenizer.decode(generated[start:end], skip_special_tokens=True)
+    thought = re.sub(r"^thought\s*\n?", "", thought).strip()
+    return thought, generated[:start - 1] + generated[end + 1:]
+
+
 # ── Chat Template Formatting ────────────────────────────────────────────────
 
 class ChatFormatter:
@@ -2024,8 +2049,10 @@ class GAIAEngine:
                             snapshot, self._sae_atlas, self._sae_labels)
                 del out
 
-            # Decode
-            text = self.tokenizer.decode(generated, skip_special_tokens=True)
+            # Decode (the native thought channel, if any, travels separately
+            # as reasoning_content — h1ok)
+            _thought, _answer_ids = _split_thought_tokens(self.tokenizer, generated)
+            text = self.tokenizer.decode(_answer_ids, skip_special_tokens=True)
             if _stops:
                 text, _ = _cut_at_stop(text, _stops, include_stop_str_in_output)
             # Preserve <think>...</think> when an adapter is active so
@@ -2078,7 +2105,9 @@ class GAIAEngine:
                 "object": "chat.completion",
                 "created": int(time.time()),
                 "model": self.model_path,
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": _clean_response_text(text)},
+                "choices": [{"index": 0, "message": {
+                                 "role": "assistant", "content": _clean_response_text(text),
+                                 **({"reasoning_content": _thought} if _thought is not None else {})},
                              "finish_reason": "stop" if _stopped or len(generated) < max_tokens else "length"}],
                 "usage": {
                     "prompt_tokens": total_input,

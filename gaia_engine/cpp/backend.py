@@ -106,6 +106,21 @@ def _write_activation(tier: str, token: str, token_idx: int,
         pass
 
 
+
+# Gemma 4's native thought channel, rendered as text by gaia_cpp (special
+# tokens are detokenized). Inlined rather than shared with core.py because
+# engine files are single-file mounts in the service containers.
+_THOUGHT_RE = re.compile(r"<\|channel>(?:thought)?\s*(.*?)(?:<channel\|>|\Z)", re.DOTALL)
+
+
+def _split_thought_text(text: str):
+    """Return (thought, answer); thought is None when there is no channel.
+    A channel cut off before <channel|> is all thought (h1ok)."""
+    m = _THOUGHT_RE.search(text or "")
+    if not m:
+        return None, text
+    return m.group(1).strip(), (text[:m.start()] + text[m.end():]).strip()
+
 class GaiaCppBackendAdapter:
     """
     In-process GGUF backend using gaia_cpp C++ extension.
@@ -371,7 +386,7 @@ class GaiaCppBackendAdapter:
 
         # Strip <think> blocks from output (Qwen3 defaults to thinking mode)
         # Handles both closed <think>...</think> and unclosed <think>... (hit max_tokens)
-        text = result.text.strip()
+        thought, text = _split_thought_text(result.text.strip())
         text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
         text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL)
         text = text.strip()
@@ -381,7 +396,8 @@ class GaiaCppBackendAdapter:
             "object":  "chat.completion",
             "choices": [{
                 "index":         0,
-                "message":       {"role": "assistant", "content": text},
+                "message":       {"role": "assistant", "content": text,
+                                  **({"reasoning_content": thought} if thought is not None else {})},
                 "finish_reason": "stop",
             }],
             "usage": {

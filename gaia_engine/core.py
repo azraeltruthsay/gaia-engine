@@ -17,6 +17,7 @@ Performance stack:
 - Optional: speculative decoding across tiers
 """
 
+import copy
 import gc
 import hashlib
 import json
@@ -524,10 +525,18 @@ class PrefixCache:
         return True
 
     def get_kv(self):
+        """Return (kv, prefix_len) for the current segments.
+
+        The kv is a private copy: the model appends each request's prompt
+        and reply to the cache it is given, in place, so handing out the
+        stored object let one request's conversation leak into the next
+        (r4p6). Cropping it back afterwards isn't safe because
+        sliding-window layers drop tokens they can't restore.
+        """
         current_hashes = {k: self._hash(v) for k, v in self.segments.items()}
         if self._cached_kv is not None and current_hashes == self._hashes:
             self._hits += 1
-            return self._cached_kv, self._cached_len
+            return copy.deepcopy(self._cached_kv), self._cached_len
 
         # Recompute
         _require_cuda_healthy(self.device)
@@ -556,7 +565,7 @@ class PrefixCache:
         # No background threads, no races.
         self._persistent_prefix_dirty = True
 
-        return self._cached_kv, self._cached_len
+        return copy.deepcopy(self._cached_kv), self._cached_len
 
     def save_persistent_prefix(self) -> bool:
         """Save KV prefix to disk during a controlled event (unload, shutdown, park).

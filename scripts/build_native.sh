@@ -50,8 +50,17 @@ for lib in libllama.so.0 libggml.so.0 libggml-base.so.0 libggml-cpu.so.0 libggml
     docker cp -L "$CID:/usr/local/lib/$lib" "$STAGE/lib/$lib"
 done
 
+# Install by rename, never by overwriting: running engines have these files
+# mapped, and rewriting a mapped .so in place crashes them (it segfaulted
+# gaia-prime). A rename leaves them on the old inode until their next restart.
+install_atomic() {  # <src> <dest-file>
+    cp "$1" "$2.new.$$" && mv -f "$2.new.$$" "$2"
+}
 mkdir -p "$DEST/lib"
-cp "$STAGE/gaia_cpp.cpython-311-x86_64-linux-gnu.so" "$DEST/"
-cp "$STAGE"/lib/*.so.0 "$DEST/lib/"
+install_atomic "$STAGE/gaia_cpp.cpython-311-x86_64-linux-gnu.so" "$DEST/gaia_cpp.cpython-311-x86_64-linux-gnu.so"
+for f in "$STAGE"/lib/*.so.0; do
+    install_atomic "$f" "$DEST/lib/$(basename "$f")"
+done
+echo "Running engines keep the previous build until restarted."
 echo "Installed into $DEST:"
 ls -la "$DEST"/gaia_cpp*.so "$DEST"/lib/

@@ -427,6 +427,28 @@ class GaiaCppBackendAdapter:
 
     # ── Prompt formatting ─────────────────────────────────────────────────────
 
+    def _family(self) -> str:
+        """'gemma' or 'chatml', from the GGUF's general.architecture.
+
+        This used to test the path for 'gemma' — via an attribute nothing ever
+        set, so every model, Gemma included, was prompted in ChatML. The
+        resolved file name is only a fallback for an extension built before
+        architecture() existed (core.gguf is a symlink that says nothing).
+        """
+        family = getattr(self, "_family_cache", None)
+        if family is None:
+            arch = ""
+            try:
+                arch = (self._backend.architecture() or "").lower()
+            except AttributeError:
+                pass
+            name = arch or os.path.basename(os.path.realpath(self.model_path or "")).lower()
+            family = "gemma" if name.startswith("gemma") or "gemma" in name else "chatml"
+            self._family_cache = family
+            logger.info("gaia_cpp prompt format: %s (architecture=%r)", family, arch or None)
+        return family
+
+
     def _build_prompt(self, messages: list, enable_thinking: bool = True) -> str:
         """Build formatted prompt for the model family.
 
@@ -436,9 +458,7 @@ class GaiaCppBackendAdapter:
         When enable_thinking=False, injects an empty think block after the
         assistant start token to suppress chain-of-thought mode.
         """
-        # Detect model family from path (cpp backend has no tokenizer)
-        model_path = getattr(self, '_model_path', '') or ''
-        is_gemma = 'gemma' in model_path.lower()
+        is_gemma = self._family() == "gemma"
 
         if is_gemma:
             parts = []

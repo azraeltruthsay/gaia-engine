@@ -313,6 +313,15 @@ public:
     bool has_gpu()      const { return false; } // TODO Phase 5: check via llama_model GPU offload state
     std::string model_path() const { return model_path_; }
 
+    // GGUF general.architecture ("gemma4", "qwen3vl", ...): the prompt format
+    // follows the model, not its file name (a symlink like core.gguf says
+    // nothing about what it points to).
+    std::string architecture() const {
+        char buf[128] = {0};
+        int n = llama_model_meta_val_str(model_, "general.architecture", buf, sizeof(buf));
+        return n > 0 ? std::string(buf) : std::string();
+    }
+
     std::vector<int> capture_layers() const {
         return capture_state_.capture_layers;
     }
@@ -744,6 +753,7 @@ PYBIND11_MODULE(gaia_cpp, m) {
         .def("n_layer",         &LlamaCppBackend::n_layer)
         .def("has_gpu",         &LlamaCppBackend::has_gpu)
         .def("model_path",      &LlamaCppBackend::model_path)
+        .def("architecture",    &LlamaCppBackend::architecture)
         .def("capture_layers",  &LlamaCppBackend::capture_layers)
         .def("set_capture_layers", &LlamaCppBackend::set_capture_layers)
         .def("capture_all_tokens", &LlamaCppBackend::capture_all_tokens)

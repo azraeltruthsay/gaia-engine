@@ -31,6 +31,20 @@ SAE_SAMPLE_RATE: int = int(os.environ.get("GAIA_SAE_SAMPLE_RATE", "4"))
 SAE_STREAM_EVERY_N: int = int(os.environ.get("GAIA_SAE_STREAM_EVERY_N", "8"))
 ACTIVATION_STREAM_PATH: str = os.environ.get("ACTIVATION_STREAM_PATH", "/logs/activation_stream.jsonl")
 
+# ── Prompt-shaping features ──────────────────────────────────────────────────
+# Dynamic awareness injection (a world-state prompt segment) and CogPacket
+# system-prompt compression (drops sections judged already known). Both change
+# what the model is shown. Until the engine was mounted as one directory they
+# were only installed in gaia-prime, so Core never ran them; they are explicit
+# settings now, and turning them on for a tier is a deliberate, evaluated change.
+
+def _flag(name: str, default: str = "1") -> bool:
+    return os.environ.get(name, default).lower() not in ("0", "false", "no", "off")
+
+
+AWARENESS_ENABLED: bool = _flag("GAIA_ENGINE_AWARENESS")
+COGPACKET_COMPRESS_ENABLED: bool = _flag("GAIA_ENGINE_COGPACKET_COMPRESS")
+
 # ── Timezone (for awareness injection) ───────────────────────────────────────
 
 LOCAL_TZ_OFFSET: int = int(os.environ.get("GAIA_LOCAL_TZ_OFFSET", "-7"))

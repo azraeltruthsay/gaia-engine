@@ -7,3 +7,7 @@ __pycache__/
 build/
 dist/
 .venv/
+
+# gaia_cpp native artifacts (scripts/build_native.sh)
+gaia_engine/cpp/*.so
+gaia_engine/cpp/lib/

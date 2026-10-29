@@ -1400,7 +1400,10 @@ class GAIAEngine:
                      sorted(self._sae_target_layers), _SAE_SAMPLE_RATE, _SAE_STREAM_EVERY_N)
 
         # Initialize dynamic awareness
+        from gaia_engine.config import AWARENESS_ENABLED
         try:
+            if not AWARENESS_ENABLED:
+                raise RuntimeError("off for this tier (GAIA_ENGINE_AWARENESS=0)")
             from gaia_engine.awareness import AwarenessManager
             self.awareness = AwarenessManager()
             logger.info("Dynamic awareness initialized (%d packages)", len(self.awareness.packages))
@@ -2144,7 +2147,8 @@ class GAIAEngine:
                         conversation.append(msg)
 
                 # CogPacket compression — skip sections already in KV cache or weights
-                if system and len(system) > 500:
+                from gaia_engine.config import COGPACKET_COMPRESS_ENABLED
+                if system and len(system) > 500 and COGPACKET_COMPRESS_ENABLED:
                     try:
                         from gaia_engine.cogpacket_compressor import compress_system_prompt
                         system = compress_system_prompt(

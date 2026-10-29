@@ -160,6 +160,11 @@ class EngineManager:
         self._worker_stderr_thread = None
         # gaia_cpp in-process backend (set when backend='cpp')
         self._cpp_backend = None
+        # Adapter name -> directory, from every /adapter/load whichever backend
+        # served it. Clients cache "already loaded" and only send /adapter/set
+        # after that, so after a gear shift swaps the backend the new one must
+        # be able to load the adapter by name itself.
+        self._adapter_paths: dict = {}
 
     def start_worker(self, model_path: str, device: str = "cuda",
                      compile_mode: str = "reduce-overhead",
@@ -476,7 +481,7 @@ class EngineManager:
         return result
 
     def proxy_to_worker(self, method: str, path: str, headers: dict,
-                        body: bytes = b"") -> tuple:
+                        body: bytes = b"", direct: bool = False) -> tuple:
         """Forward a request to the worker. Returns (status, headers_dict, body_bytes).
 
         Inference requests (/v1/chat/completions) are serialized through a
@@ -486,8 +491,14 @@ class EngineManager:
         with self._lock:
             cpp = self._cpp_backend
 
+        if path == "/adapter/load" and method == "POST" and body:
+            self._remember_adapter(body)
+
         if cpp is not None:
             return self._proxy_cpp(method, path, body, cpp)
+
+        if path == "/adapter/set" and method == "POST" and body and not direct:
+            return self._set_adapter_on_worker(headers, body)
 
         with self._lock:
             port = self.worker_port
@@ -620,6 +631,7 @@ class EngineManager:
 
         if cpp is not None:
             h = cpp.health()
+            h["engine"] = "gaia-managed"  # how clients tell the GAIA engine from vLLM
             h["managed"] = True
             h["model_loaded"] = True
             h["mode"] = "active"
@@ -830,12 +842,49 @@ class EngineManager:
         return {"model_loaded": False, "model_path": "", "device": "none",
                 "backend": backend or "none", "vram_mb": 0}
 
+    def _remember_adapter(self, body: bytes):
+        try:
+            req = json.loads(body)
+        except (ValueError, TypeError):
+            return
+        name, path = req.get("name"), req.get("path") or req.get("adapter_path")
+        if name and path:
+            self._adapter_paths[name] = path
+
+    def _set_adapter_on_worker(self, headers: dict, body: bytes) -> tuple:
+        """/adapter/set on the torch worker, loading the adapter first when the
+        worker doesn't have it (it was loaded on the backend before a shift)."""
+        status, resp_headers, resp = self.proxy_to_worker("POST", "/adapter/set", headers, body, direct=True)
+        try:
+            name = json.loads(body).get("name")
+            result = json.loads(resp)
+        except (ValueError, TypeError):
+            return status, resp_headers, resp
+        if name and not result.get("ok") and "not loaded" in str(result.get("error", "")) \
+                and name in self._adapter_paths:
+            logger.info("Adapter '%s' not on this worker; loading it from %s", name, self._adapter_paths[name])
+            load = json.dumps({"name": name, "path": self._adapter_paths[name]}).encode()
+            self.proxy_to_worker("POST", "/adapter/load", {"Content-Type": "application/json"}, load, direct=True)
+            status, resp_headers, resp = self.proxy_to_worker("POST", "/adapter/set", headers, body, direct=True)
+        return status, resp_headers, resp
+
+    @staticmethod
+    def _cpp_adapter_file(path: str) -> str:
+        """An adapter directory's adapter.gguf, or the path itself if it's a file."""
+        if path and os.path.isdir(path):
+            return os.path.join(path, "adapter.gguf")
+        return path or ""
+
     def _proxy_cpp(self, method: str, path: str, body: bytes, cpp) -> tuple:
         """Handle a request via the gaia_cpp in-process backend (non-streaming)."""
         ct = {"Content-Type": "application/json"}
 
         if path == "/health":
             h = cpp.health()
+            # Clients tell the GAIA engine from vLLM by this field (gaia-core's
+            # VLLMRemoteModel); without it they sent vLLM-style adapter calls
+            # that gaia_cpp ignores, so Core's CPU gear never got its LoRA.
+            h["engine"] = "gaia"
             h["managed"] = True
             h["model_loaded"] = True
             h["mode"] = "active"
@@ -937,7 +986,10 @@ class EngineManager:
                     return (400, ct, json.dumps({"ok": False, "error": "adapter_path or path required"}).encode())
 
                 name = req_data.get("name", _os.path.basename(_os.path.dirname(adapter_path)))
-                ok = cpp.load_adapter(adapter_path, scale)
+                # One active adapter on gaia_cpp: replace, don't stack.
+                if cpp._lora_path and cpp._lora_path != adapter_path:
+                    cpp.unload_adapter()
+                ok = cpp._lora_path == adapter_path or cpp.load_adapter(adapter_path, scale)
                 return (200, ct, json.dumps({
                     "ok": ok, "adapter": name, "adapter_path": adapter_path,
                     "scale": scale, "vram_mb": 0,
@@ -951,14 +1003,26 @@ class EngineManager:
             return (200, ct, json.dumps({"ok": True}).encode())
 
         if path == "/adapter/set" and method == "POST" and body:
-            # For cpp backend, set = load (only one active at a time)
-            req_data = json.loads(body)
-            name = req_data.get("name", "")
-            h = cpp.health()
-            return (200, ct, json.dumps({
-                "ok": True, "active": name,
-                "loaded": [name] if h.get("lora_active", 0) > 0 else [],
-            }).encode())
+            # One active adapter on gaia_cpp: None clears it, a name loads that
+            # adapter's GGUF in place of the current one. (This used to answer
+            # ok without doing either, so base-model requests kept whatever
+            # LoRA had been loaded, and named ones never got theirs.)
+            name = json.loads(body).get("name")
+            if not name:
+                if cpp._lora_path:
+                    cpp.unload_adapter()
+                return (200, ct, json.dumps({"ok": True, "active": None}).encode())
+            gguf = self._cpp_adapter_file(self._adapter_paths.get(name, ""))
+            if not gguf or not os.path.isfile(gguf):
+                return (404, ct, json.dumps({
+                    "ok": False, "error": f"adapter '{name}' has no adapter.gguf known to this engine",
+                }).encode())
+            if cpp._lora_path != gguf:
+                if cpp._lora_path:
+                    cpp.unload_adapter()
+                if not cpp.load_adapter(gguf, 1.0):
+                    return (500, ct, json.dumps({"ok": False, "error": f"failed to load {gguf}"}).encode())
+            return (200, ct, json.dumps({"ok": True, "active": name, "loaded": [name]}).encode())
 
         if path == "/adapter/list" and (method == "GET" or method == "POST"):
             h = cpp.health()

@@ -57,3 +57,26 @@ def test_text_without_channel_is_untouched():
 
 def test_text_cut_off_inside_thought_is_all_thought():
     assert _split_thought_text("<|channel>thought\nStill counting") == ("Still counting", "")
+
+
+from gaia_engine.thoughts import split_think_text  # noqa: E402
+
+
+def test_qwen_think_block_splits():
+    assert split_think_text("<think>\nadd them\n</think>\n\nFour.") == ("add them", "Four.")
+
+
+def test_qwen_prefilled_think_has_only_a_close():
+    assert split_think_text("add them\n</think>\n\nFour.") == ("add them", "Four.")
+
+
+def test_qwen_think_cut_off_is_all_thought():
+    assert split_think_text("<think>\nstill adding") == ("still adding", "")
+
+
+def test_qwen_empty_think_block_leaves_answer():
+    assert split_think_text("<think>\n\n</think>\n\nFour.") == ("", "Four.")
+
+
+def test_text_without_think_is_untouched():
+    assert split_think_text("Four.") == (None, "Four.")

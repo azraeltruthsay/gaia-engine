@@ -2357,13 +2357,12 @@ class GAIAEngine:
             text = self.tokenizer.decode(_answer_ids, skip_special_tokens=True)
             if _stops:
                 text, _ = _cut_at_stop(text, _stops, include_stop_str_in_output)
-            # Preserve <think>...</think> when an adapter is active so
-            # adapter-driven deliberation traces reach the caller's parser
-            # intact. Strip for base-model inference to keep responses tidy.
-            if "<think>" in text and self._active_adapter is None:
-                text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
-                text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL)
-                text = text.strip()
+            # Qwen3's <think>...</think> survives decoding as text: it travels
+            # as reasoning_content too (isep), with or without an adapter, so
+            # the answer is never the thought and the thought is never lost.
+            if _thought is None:
+                from gaia_engine.thoughts import split_think_text
+                _thought, text = split_think_text(text)
 
             # Tool-call passthrough (2026-05-15, GAIA_Project-8x1):
             # Previously this block stripped ALL <tool_call>...</tool_call>

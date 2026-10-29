@@ -107,19 +107,9 @@ def _write_activation(tier: str, token: str, token_idx: int,
 
 
 
-# Gemma 4's native thought channel, rendered as text by gaia_cpp (special
-# tokens are detokenized). Inlined rather than shared with core.py because
-# engine files are single-file mounts in the service containers.
-_THOUGHT_RE = re.compile(r"<\|channel>(?:thought)?\s*(.*?)(?:<channel\|>|\Z)", re.DOTALL)
+# Native thought (Gemma 4's channel, Qwen3's <think>) -> reasoning_content.
+from gaia_engine.thoughts import split_thought_text as _split_thought_text  # noqa: E402
 
-
-def _split_thought_text(text: str):
-    """Return (thought, answer); thought is None when there is no channel.
-    A channel cut off before <channel|> is all thought (h1ok)."""
-    m = _THOUGHT_RE.search(text or "")
-    if not m:
-        return None, text
-    return m.group(1).strip(), (text[:m.start()] + text[m.end():]).strip()
 
 class GaiaCppBackendAdapter:
     """
@@ -384,11 +374,9 @@ class GaiaCppBackendAdapter:
             )
         self._log_reuse(result)
 
-        # Strip <think> blocks from output (Qwen3 defaults to thinking mode)
-        # Handles both closed <think>...</think> and unclosed <think>... (hit max_tokens)
+        # The native thought (Gemma 4 channel or Qwen3 <think>, closed or cut
+        # off) travels as reasoning_content; it used to be stripped and lost.
         thought, text = _split_thought_text(result.text.strip())
-        text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
-        text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL)
         text = text.strip()
 
         return {

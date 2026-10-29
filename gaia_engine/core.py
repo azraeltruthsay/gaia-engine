@@ -1931,7 +1931,8 @@ class GAIAEngine:
                  skip_prefix: bool = False,
                  enable_thinking: bool = True,
                  repetition_penalty: float = 1.1,
-                 stop=None, include_stop_str_in_output: bool = False) -> dict:
+                 stop=None, include_stop_str_in_output: bool = False,
+                 native_thinking: bool = False) -> dict:
         """Generate a chat completion with full introspection.
 
         Args:
@@ -2266,8 +2267,11 @@ class GAIAEngine:
             _REP_WINDOW = 256
             _rep_window_set: set[int] = set()
             for step in range(max_tokens):
-                # Suppress <think> if the token exists in this model's vocab
-                if 0 <= _think_token_id < logits.shape[-1]:
+                # Suppress <think> if the token exists in this model's vocab —
+                # unless the caller asked for the model's native thinking
+                # (isep: Prime's thinking adapter opens a <think> block, and
+                # with it masked wrote an empty one and answered unthought).
+                if not native_thinking and 0 <= _think_token_id < logits.shape[-1]:
                     logits[0, _think_token_id] = float("-inf")
 
                 # Repetition penalty — HF-style two-sided rescaling so it
@@ -2422,7 +2426,8 @@ class GAIAEngine:
     def generate_stream(self, messages: list, max_tokens: int = 512,
                          temperature: float = 0.7, top_p: float = 0.9,
                          session_id: str = "", stop=None,
-                         include_stop_str_in_output: bool = False):
+                         include_stop_str_in_output: bool = False,
+                         native_thinking: bool = False):
         """Generate a chat completion with per-token streaming.
 
         Yields dicts with delta content for each token, compatible with
@@ -2548,7 +2553,7 @@ class GAIAEngine:
             prev_text = ""
 
             for step in range(max_tokens):
-                if 0 <= _think_token_id < logits.shape[-1]:
+                if not native_thinking and 0 <= _think_token_id < logits.shape[-1]:
                     logits[0, _think_token_id] = float("-inf")
 
                 # Sample — single-pass softmax (no redundant computation)
@@ -2951,7 +2956,8 @@ class EngineHandler(BaseHTTPRequestHandler):
                         b.get("messages", []), b.get("max_tokens", 512),
                         b.get("temperature", 0.7), b.get("top_p", 0.9),
                         stop=b.get("stop"),
-                        include_stop_str_in_output=bool(b.get("include_stop_str_in_output"))):
+                        include_stop_str_in_output=bool(b.get("include_stop_str_in_output")),
+                        native_thinking=bool((b.get("chat_template_kwargs") or {}).get("native_thinking"))):
                         self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
                         self.wfile.flush()
                     self.wfile.write(b"data: [DONE]\n\n")
@@ -2974,7 +2980,10 @@ class EngineHandler(BaseHTTPRequestHandler):
                         enable_thinking=_template_kwargs.get("enable_thinking", True),
                         repetition_penalty=float(_rep_pen),
                         stop=b.get("stop"),
-                        include_stop_str_in_output=bool(b.get("include_stop_str_in_output")))
+                        include_stop_str_in_output=bool(b.get("include_stop_str_in_output")),
+                        # explicit opt-in: the client defaults enable_thinking
+                        # to True on every request, so it can't mean "think"
+                        native_thinking=bool(_template_kwargs.get("native_thinking")))
                     self._json(result)
             except GPUUnavailableError as e:
                 # Distinct from a normal generation error (500) so the

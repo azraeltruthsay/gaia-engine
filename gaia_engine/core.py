@@ -388,6 +388,17 @@ def _clean_response_text(text: str) -> str:
     return cleaned.strip()
 
 
+def _think_close_token_id(tokenizer) -> int:
+    """Id of Qwen3's </think>, or -1 when the vocab has none (Gemma 4)."""
+    try:
+        tid = tokenizer.convert_tokens_to_ids("</think>")
+    except Exception:
+        return -1
+    if tid is None or tid == getattr(tokenizer, "unk_token_id", None):
+        return -1
+    return tid
+
+
 def _split_thought_tokens(tokenizer, generated: list):
     """Separate Gemma 4's native thought channel from the answer.
 
@@ -458,8 +469,13 @@ class ChatFormatter:
         """Format a system message."""
         return self.format_message("system", content)
 
-    def assistant_prefix(self, enable_thinking: bool = True) -> str:
-        """Return the assistant generation prefix with optional think suppression."""
+    def assistant_prefix(self, enable_thinking: bool = True, native_thinking: bool = False) -> str:
+        """Return the assistant generation prefix with optional think suppression.
+
+        native_thinking (ChatML) opens the thought for the model, as Qwen's
+        Thinking template does: prime_thinking_v1 learned to write <think>
+        itself, and when sampling skipped that first token it never thought.
+        """
         if self.family == "gemma4":
             prefix = "<|turn>assistant<turn|>\n"
             if not enable_thinking:
@@ -469,10 +485,13 @@ class ChatFormatter:
         prefix = "<|im_start|>assistant\n"
         if not enable_thinking:
             prefix += "<think>\n\n</think>\n\n"
+        elif native_thinking:
+            prefix += "<think>\n"
         return prefix
 
     def format_conversation(self, messages: list, enable_thinking: bool = True,
-                            add_generation_prompt: bool = True) -> str:
+                            add_generation_prompt: bool = True,
+                            native_thinking: bool = False) -> str:
         """Format a full conversation (system + user/assistant turns + generation prompt).
 
         Args:
@@ -484,7 +503,7 @@ class ChatFormatter:
         for msg in messages:
             parts.append(self.format_message(msg["role"], msg.get("content", "")))
         if add_generation_prompt:
-            parts.append(self.assistant_prefix(enable_thinking))
+            parts.append(self.assistant_prefix(enable_thinking, native_thinking))
         return "\n".join(parts)
 
     @property
@@ -2126,7 +2145,7 @@ class GAIAEngine:
                 # Dynamic part: only the user's actual question (~10 tokens)
                 actual_question = conversation[-1].get("content", "") if conversation else ""
                 conv_text = (self.formatter.format_message("user", actual_question)
-                             + "\n" + self.formatter.assistant_prefix(enable_thinking))
+                             + "\n" + self.formatter.assistant_prefix(enable_thinking, native_thinking))
 
                 if past_kv is not None:
                     input_ids = self.tokenizer.encode(conv_text, return_tensors="pt",
@@ -2194,7 +2213,7 @@ class GAIAEngine:
                     parts.append(self.formatter.format_system(f"[Clock: {utc_str}]"))
                 for msg in conversation:
                     parts.append(self.formatter.format_message(msg['role'], msg['content']))
-                parts.append(self.formatter.assistant_prefix(enable_thinking))
+                parts.append(self.formatter.assistant_prefix(enable_thinking, native_thinking))
                 conv_text = "\n".join(parts)
 
                 if past_kv is not None:
@@ -2253,6 +2272,12 @@ class GAIAEngine:
             _think_token_id = self.tokenizer.convert_tokens_to_ids(self.formatter.think_token)
             if _think_token_id is None or _think_token_id == self.tokenizer.unk_token_id:
                 _think_token_id = -1  # Not in vocab — skip suppression
+            # Native thinking gets one thought: once </think> is out, <think>
+            # is masked again. Prime's adapter otherwise re-opened the thought
+            # on long prompts, looping think → </think> → <think> until
+            # max_tokens without answering, and the last loop was voiced.
+            _think_close_id = _think_close_token_id(self.tokenizer)
+            _thought_closed = False
             _eos_only = {self.formatter.eos_token_id}  # always stop immediately
             _soft_stop = _stop_ids - _eos_only  # stop after min tokens (e.g. <turn|>)
             _MIN_TOKENS_BEFORE_SOFT_STOP = 3
@@ -2271,7 +2296,7 @@ class GAIAEngine:
                 # unless the caller asked for the model's native thinking
                 # (isep: Prime's thinking adapter opens a <think> block, and
                 # with it masked wrote an empty one and answered unthought).
-                if not native_thinking and 0 <= _think_token_id < logits.shape[-1]:
+                if (not native_thinking or _thought_closed) and 0 <= _think_token_id < logits.shape[-1]:
                     logits[0, _think_token_id] = float("-inf")
 
                 # Repetition penalty — HF-style two-sided rescaling so it
@@ -2321,6 +2346,8 @@ class GAIAEngine:
                 if token in _soft_stop and step >= _MIN_TOKENS_BEFORE_SOFT_STOP:
                     break
                 generated.append(token)
+                if token == _think_close_id:
+                    _thought_closed = True
                 if _stops and any(s_ in self.tokenizer.decode(
                         generated[-_STOP_TAIL_TOKENS:], skip_special_tokens=True) for s_ in _stops):
                     _stopped = True
@@ -2366,6 +2393,10 @@ class GAIAEngine:
             # the answer is never the thought and the thought is never lost.
             if _thought is None:
                 from gaia_engine.thoughts import split_think_text
+                if native_thinking and self.formatter.family != "gemma4":
+                    # The prompt opened the thought (assistant_prefix), so the
+                    # text starts inside it: one never closed is all thought.
+                    text = "<think>\n" + text
                 _thought, text = split_think_text(text)
 
             # Tool-call passthrough (2026-05-15, GAIA_Project-8x1):
@@ -2497,6 +2528,8 @@ class GAIAEngine:
             if system:
                 all_msgs.append({"role": "system", "content": system})
             all_msgs.extend(conversation)
+            # No think prefill here: the stream carries raw text and its
+            # consumer finds the thought by its <think> marker.
             prompt = self.formatter.format_conversation(all_msgs, enable_thinking=True)
 
             input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.model.device)
@@ -2513,6 +2546,9 @@ class GAIAEngine:
                     _think_token_id = _ids[-1]
             except Exception:
                 pass
+            # One thought per turn in native mode (see generate)
+            _think_close_id = _think_close_token_id(self.tokenizer)
+            _thought_closed = False
 
             # Activation streaming setup
             _capture = self.monitor.enabled
@@ -2553,7 +2589,7 @@ class GAIAEngine:
             prev_text = ""
 
             for step in range(max_tokens):
-                if not native_thinking and 0 <= _think_token_id < logits.shape[-1]:
+                if (not native_thinking or _thought_closed) and 0 <= _think_token_id < logits.shape[-1]:
                     logits[0, _think_token_id] = float("-inf")
 
                 # Sample — single-pass softmax (no redundant computation)
@@ -2579,6 +2615,8 @@ class GAIAEngine:
                 if token in _soft_stop and step >= _MIN_TOKENS_BEFORE_SOFT_STOP:
                     break
                 generated.append(token)
+                if token == _think_close_id:
+                    _thought_closed = True
 
                 # Decode incrementally — get the new text added by this token
                 full_text = self.tokenizer.decode(generated, skip_special_tokens=True)

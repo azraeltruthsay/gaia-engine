@@ -31,21 +31,28 @@ def split_think_text(text: str) -> Tuple[Optional[str], str]:
     """Qwen3 <think> block: (thought, answer); thought None if absent.
 
     Handles a closed block, a block cut off before </think> (all thought), and
-    a lone </think> (the opening <think> was part of the prompt prefill).
+    a lone </think> (the opening <think> was part of the prompt prefill). A
+    thought re-opened after the first one closed is thought too, never
+    answer: Prime's adapter looped think → </think> → <think> on long prompts
+    and the last pass, its <think> already consumed, was voiced.
     """
     text = text or ""
     start = text.find(_THINK_OPEN)
     end = text.find(_THINK_CLOSE)
     if start < 0 and end < 0:
         return None, text
-    if start < 0:                       # opened by the prefill
-        return text[:end].strip(), text[end + len(_THINK_CLOSE):].strip()
-    body_start = start + len(_THINK_OPEN)
-    end = text.find(_THINK_CLOSE, body_start)
-    if end < 0:                         # cut off inside the thought
-        return text[body_start:].strip(), text[:start].strip()
-    answer = (text[:start] + text[end + len(_THINK_CLOSE):]).strip()
-    return text[body_start:end].strip(), answer
+    if start < 0 or 0 <= end < start:   # opened by the prefill
+        thought, rest = text[:end], text[end + len(_THINK_CLOSE):]
+    else:
+        body_start = start + len(_THINK_OPEN)
+        end = text.find(_THINK_CLOSE, body_start)
+        if end < 0:                     # cut off inside the thought
+            return text[body_start:].strip(), text[:start].strip()
+        thought, rest = text[body_start:end], text[:start] + text[end + len(_THINK_CLOSE):]
+    reopened = rest.find(_THINK_OPEN)
+    if reopened >= 0:
+        rest = rest[:reopened]
+    return thought.strip(), rest.replace(_THINK_CLOSE, "").strip()
 
 
 def split_thought_text(text: str) -> Tuple[Optional[str], str]:

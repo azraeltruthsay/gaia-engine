@@ -80,3 +80,48 @@ def test_qwen_empty_think_block_leaves_answer():
 
 def test_text_without_think_is_untouched():
     assert split_think_text("Four.") == (None, "Four.")
+
+
+def test_qwen_reopened_think_is_never_voiced():
+    # prefilled <think>; thought closes, re-opens, closes, then a third pass runs out
+    text = "add them\n</think>\n\n<think>\nadd again\n</think>\n\nOkay, let me think again"
+    assert split_think_text(text) == ("add them", "")
+
+
+def test_qwen_answer_then_reopened_think_keeps_the_answer():
+    assert split_think_text("<think>\nadd\n</think>\n\nFour.\n<think>\nmore") == ("add", "Four.")
+
+
+from gaia_engine.core import _think_close_token_id  # noqa: E402
+
+
+def test_think_close_id_resolves_or_is_absent():
+    class T:
+        unk_token_id = 0
+
+        def __init__(self, vocab):
+            self.vocab = vocab
+
+        def convert_tokens_to_ids(self, t):
+            return self.vocab.get(t, 0)
+    assert _think_close_token_id(T({"</think>": 151668})) == 151668
+    assert _think_close_token_id(T({})) == -1
+
+
+from gaia_engine.core import ChatFormatter  # noqa: E402
+
+
+def _chatml_formatter():
+    f = ChatFormatter.__new__(ChatFormatter)  # skip tokenizer-based family detection
+    f.family = "chatml"
+    return f
+
+
+def test_native_thinking_opens_the_thought_for_qwen():
+    assert _chatml_formatter().assistant_prefix(True, native_thinking=True) == "<|im_start|>assistant\n<think>\n"
+
+
+def test_plain_and_suppressed_prefixes_unchanged():
+    f = _chatml_formatter()
+    assert f.assistant_prefix(True) == "<|im_start|>assistant\n"
+    assert f.assistant_prefix(False, native_thinking=True) == "<|im_start|>assistant\n<think>\n\n</think>\n\n"

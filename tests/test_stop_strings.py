@@ -48,7 +48,7 @@ class Formatter:
     eos_token_id = EOS
     think_token = "<think>"
 
-    def format_conversation(self, msgs, enable_thinking=True):
+    def format_conversation(self, msgs, enable_thinking=True, native_thinking=False):
         return "prompt"
 
 

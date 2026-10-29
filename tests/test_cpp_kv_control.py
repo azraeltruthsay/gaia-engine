@@ -35,6 +35,7 @@ def _adapter(fake):
     a._backend = fake
     a._request_lock = threading.Lock()
     a._kv_control = hasattr(fake, "kv_stats")
+    a._kv_last = {}
     return a
 
 
@@ -55,3 +56,16 @@ def test_older_extension_without_kv_api_degrades_quietly(tmp_path):
     a = _adapter(types.SimpleNamespace())  # no kv_* methods
     assert a.kv_stats() == {} and a.clear_kv() is False
     assert a.save_kv(str(tmp_path / "x.kvstate")) == 0 and a.load_kv(str(tmp_path / "x.kvstate")) == 0
+
+
+def test_kv_stats_never_waits_on_a_running_request():
+    """The extension's kv_stats takes the inference mutex with the GIL held;
+    during a generation /health must serve the last reading instead."""
+    fake = FakeKvBackend()
+    a = _adapter(fake)
+    fake.stats["cached_tokens"] = 330
+    assert a.kv_stats()["cached_tokens"] == 330       # idle: live read
+    fake.kv_stats = lambda: pytest.fail("kv_stats called during a request")
+    with a._request_lock:                              # a generation is running
+        got = a.kv_stats()
+    assert got["cached_tokens"] == 330 and got["busy"] is True

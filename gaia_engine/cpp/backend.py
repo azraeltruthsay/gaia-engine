@@ -171,6 +171,7 @@ class GaiaCppBackendAdapter:
         )
 
         self._request_lock = threading.Lock()  # single active request guard
+        self._kv_last: dict = {}  # last kv_stats read, served while a request runs
         self._lora_path: Optional[str] = None
 
         # d12t: KV reuse between requests (prefix reuse + in-memory
@@ -214,14 +215,27 @@ class GaiaCppBackendAdapter:
     # ── KV cache control (d12t) ───────────────────────────────────────────────
 
     def kv_stats(self) -> dict:
-        """Prefix-reuse / snapshot counters, or {} on an older extension."""
+        """Prefix-reuse / snapshot counters, or {} on an older extension.
+
+        Never waits on a running request: the extension's kv_stats takes the
+        inference mutex and is called with the GIL held, so during a
+        generation it stalled every thread in the process for the whole
+        generation — /health with it, and gaia-core's readiness gate turned
+        users away ("my inference engine is loading") whenever Core's CPU
+        gear was busy. While a request runs, the last reading is served.
+        """
         if not self._kv_control:
             return {}
+        if not self._request_lock.acquire(blocking=False):
+            return {**self._kv_last, "busy": True}
         try:
-            return dict(self._backend.kv_stats())
+            self._kv_last = dict(self._backend.kv_stats())
+            return self._kv_last
         except Exception as e:  # never fail /health over stats
             logger.debug("kv_stats failed: %s", e)
             return {"error": str(e)}
+        finally:
+            self._request_lock.release()
 
     def clear_kv(self) -> bool:
         if not self._kv_control:

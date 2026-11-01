@@ -38,6 +38,10 @@ from socketserver import ThreadingMixIn
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
+# sy0s: how long a direct /model/swap or /model/unload waits for in-flight
+# inference before killing the worker anyway.
+DRAIN_TIMEOUT_S = float(os.environ.get("GAIA_DRAIN_TIMEOUT_S", "30"))
+
 logger = logging.getLogger("GAIA.EngineManager")
 
 def _apply_stop(text: str, stop, include: bool) -> str:
@@ -178,6 +182,12 @@ class EngineManager:
         with self._lock:
             if self.worker_process is not None:
                 return {"ok": False, "error": "model already loaded — unload first or use /model/swap"}
+            # sy0s: a new worker has nothing in flight. A drain left set (a
+            # timeout nobody resumed) would 503 every request after reload.
+            if self._draining:
+                logger.info("Clearing a stale drain before starting %s", model_path)
+            self._draining = False
+            self._drain_event.set()
 
             internal_port = _find_free_port()
             is_gguf = model_path.lower().endswith('.gguf')
@@ -469,13 +479,38 @@ class EngineManager:
             return result
         return {"ok": True, "cancelled": True, "respawned": False}
 
+    def _begin_drain(self) -> bool:
+        """Drain before a direct unload/swap (sy0s). Returns True when this
+        call started the drain — and so must resume — False when a caller
+        (the orchestrator's drain → unload → load → resume) already holds it."""
+        with self._lock:
+            if self._draining:
+                return False
+        self.drain(DRAIN_TIMEOUT_S)
+        return True
+
+    def stop_worker_drained(self) -> dict:
+        """stop_worker after in-flight inference finishes (bounded wait)."""
+        owner = self._begin_drain()
+        try:
+            return self.stop_worker()
+        finally:
+            if owner:
+                self.resume()
+
     def swap_worker(self, model_path: str, device: str = "cuda",
                     compile_mode: str = "reduce-overhead",
                     quantize: str = "") -> dict:
-        """Swap models: kill old worker, spawn new one."""
+        """Swap models: drain, kill old worker, spawn new one. The drain stops
+        a direct /model/swap from cutting a live generation (sy0s)."""
         old_model = self.model_path
-        self.stop_worker()
-        result = self.start_worker(model_path, device, compile_mode, quantize)
+        owner = self._begin_drain()
+        try:
+            self.stop_worker()
+            result = self.start_worker(model_path, device, compile_mode, quantize)
+        finally:
+            if owner:
+                self.resume()
         if result.get("ok"):
             result["old_model"] = old_model
         return result
@@ -1149,7 +1184,7 @@ class ManagedEngineHandler(BaseHTTPRequestHandler):
             self._json(result, status)
 
         elif self.path == "/model/unload":
-            self._json(self.manager.stop_worker())
+            self._json(self.manager.stop_worker_drained())
 
         elif self.path == "/model/swap":
             b = json.loads(raw_body) if raw_body else {}

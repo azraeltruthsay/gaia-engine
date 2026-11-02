@@ -976,7 +976,8 @@ class _GraphDecoder:
         with torch.cuda.graph(graph):
             logits_out, hidden_out = self._forward(hidden)
         self.graphs[key] = (graph, logits_out, hidden_out)
-        logger.info("CUDA-graph decode step recorded for %s (static KV %d tokens)", key, self.max_len)
+        logger.info("CUDA-graph decode step recorded for %s (static KV %d tokens); VRAM %s",
+                    key, self.max_len, _vram_breakdown("cuda"))
 
     def step(self, next_id, key):
         """Feed one token; returns (logits [1, vocab], hidden_states or None).
@@ -1003,6 +1004,39 @@ class _GraphDecoder:
             logits, hidden = self._forward(key[1])
         self.pos += 1
         return logits, hidden
+
+
+_VRAM_CACHE_KEEP_MB = 256  # allocator cache worth keeping between requests
+
+
+def _release_cached_vram(device: str) -> None:
+    """Return allocator cache to the driver after a request. Cached blocks are
+    invisible to every other GPU process and to our own free-memory checks,
+    and reallocating them costs far less than the graph decode that a full GPU
+    forces us to skip."""
+    if device != "cuda":
+        return
+    try:
+        if torch.cuda.memory_reserved() - torch.cuda.memory_allocated() > _VRAM_CACHE_KEEP_MB * 2 ** 20:
+            torch.cuda.empty_cache()
+    except Exception as e:  # a dead GPU surfaces on the next request, not here
+        logger.debug("VRAM cache release skipped: %s", e)
+
+
+def _vram_breakdown(device: str) -> Optional[Dict[str, int]]:
+    """This process's GPU memory in MB. Allocated is what live tensors use;
+    reserved also counts allocator cache and CUDA-graph pools; device_used is
+    the whole GPU, every process included."""
+    if device != "cuda":
+        return None
+    free, total = torch.cuda.mem_get_info()
+    return {
+        "allocated_mb": torch.cuda.memory_allocated() // 2 ** 20,
+        "reserved_mb": torch.cuda.memory_reserved() // 2 ** 20,
+        "peak_allocated_mb": torch.cuda.max_memory_allocated() // 2 ** 20,
+        "peak_reserved_mb": torch.cuda.max_memory_reserved() // 2 ** 20,
+        "device_used_mb": (total - free) // 2 ** 20,
+    }
 
 
 # ── GAIA Engine ──────────────────────────────────────────────────────────────
@@ -1552,6 +1586,7 @@ class GAIAEngine:
         self._drop_graph_decoder()
         try:
             need_mb = _static_kv_bytes_per_token(self.model.config.get_text_config()) * length / 2 ** 20
+            torch.cuda.empty_cache()  # our own cached blocks read as used below
             free_mb = torch.cuda.mem_get_info()[0] / 2 ** 20
             if free_mb < need_mb + _GRAPH_VRAM_MARGIN_MB:
                 logger.info("CUDA-graph decode skipped: static KV for %d tokens needs %.0fMB, %.0fMB free",
@@ -2790,6 +2825,7 @@ class GAIAEngine:
             "model": self.model_path,
             "device": self.device,
             "vram_mb": mem,
+            "vram": _vram_breakdown(self.device),
             "requests": self._request_count,
             "total_tokens": self._total_tokens,
             "uptime_s": round(time.time() - self._started_at, 1),
@@ -3038,6 +3074,9 @@ class EngineHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 logger.exception("Generation failed")
                 self._json({"error": str(e)}, 500)
+            finally:
+                if _engine is not None:
+                    _release_cached_vram(_engine.device)
         elif self.path == "/device/gpu":
             self._json(_engine.migrate_to("cuda"))
         elif self.path == "/device/cpu":

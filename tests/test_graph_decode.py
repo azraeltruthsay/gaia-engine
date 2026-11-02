@@ -74,3 +74,26 @@ def test_key_whose_capture_failed_uses_dynamic_cache():
     eng._graph_decoder = SimpleNamespace(model=eng.model, max_len=4096, failed={("core_thinking_v1", True)})
     assert GAIAEngine._graph_decoder_for(eng, 3000, ("core_thinking_v1", True)) is None
     assert GAIAEngine._graph_decoder_for(eng, 3000, (None, True)) is eng._graph_decoder
+
+
+def test_own_cached_blocks_do_not_read_as_a_full_gpu(monkeypatch):
+    # mem_get_info counts our allocator cache as used: release it before deciding.
+    calls = []
+    monkeypatch.setattr(core.torch.cuda, "empty_cache", lambda: calls.append("empty"))
+    monkeypatch.setattr(core.torch.cuda, "mem_get_info",
+                        lambda: (calls.append("free"), (0, 16 * 2 ** 30))[1])
+    assert GAIAEngine._graph_decoder_for(_engine(_drop_graph_decoder=lambda: None), 1000) is None
+    assert calls == ["empty", "free"]
+
+
+def test_cache_release_only_when_worth_it(monkeypatch):
+    emptied = []
+    monkeypatch.setattr(core.torch.cuda, "empty_cache", lambda: emptied.append(1))
+    monkeypatch.setattr(core.torch.cuda, "memory_allocated", lambda: 10 * 2 ** 30)
+    monkeypatch.setattr(core.torch.cuda, "memory_reserved", lambda: 10 * 2 ** 30 + 2 ** 20)
+    core._release_cached_vram("cuda")
+    assert emptied == []
+    monkeypatch.setattr(core.torch.cuda, "memory_reserved", lambda: 12 * 2 ** 30)
+    core._release_cached_vram("cuda")
+    core._release_cached_vram("cpu")
+    assert emptied == [1]

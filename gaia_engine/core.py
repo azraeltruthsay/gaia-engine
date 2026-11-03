@@ -317,6 +317,9 @@ _TRAILING_ARTIFACT_RE = re.compile(
 )
 
 
+_ONLY_CLOCK_RE = re.compile(r'\s*\[Clock:([^\]]*)\]\s*', re.IGNORECASE)
+
+
 def _collapse_repeated_lines(text: str) -> str:
     """Collapse runs of identical (or near-identical) lines.
 
@@ -385,6 +388,12 @@ def _clean_response_text(text: str) -> str:
         return text
     cleaned = _TRAILING_ARTIFACT_RE.sub('', text)
     cleaned = _collapse_repeated_lines(cleaned)
+    if not cleaned.strip():
+        # Her whole answer was the clock line ("What time is it?"). That isn't
+        # residue trailing a reply: erased, it came back empty.
+        only_clock = _ONLY_CLOCK_RE.fullmatch(text)
+        if only_clock:
+            return only_clock.group(1).strip()
     return cleaned.strip()
 
 
@@ -2020,12 +2029,9 @@ class GAIAEngine:
 
             # Compute current time (used by both modes)
             try:
-                from gaia_engine.config import LOCAL_TZ_OFFSET, LOCAL_TZ_LABEL
-                _tz_offset = LOCAL_TZ_OFFSET
-                _tz_label = LOCAL_TZ_LABEL
-                local_tz = timezone(timedelta(hours=_tz_offset))
-                now_utc = datetime.now(timezone.utc)
-                now_local = now_utc.astimezone(local_tz)
+                from gaia_engine.config import local_now
+                now_local, _tz_label = local_now()
+                now_utc = now_local.astimezone(timezone.utc)
                 utc_str = now_utc.strftime('%H:%M UTC')
                 local_str = now_local.strftime('%I:%M %p') + f" {_tz_label} (Local)"
                 local_simple = now_local.strftime('%-I:%M %p') + f" {_tz_label}, " + now_local.strftime('%A, %B %d, %Y')

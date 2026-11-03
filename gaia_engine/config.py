@@ -50,6 +50,20 @@ COGPACKET_COMPRESS_ENABLED: bool = _flag("GAIA_ENGINE_COGPACKET_COMPRESS")
 LOCAL_TZ_OFFSET: int = int(os.environ.get("GAIA_LOCAL_TZ_OFFSET", "-7"))
 LOCAL_TZ_LABEL: str = os.environ.get("GAIA_LOCAL_TZ_LABEL", "PDT")
 
+
+def local_now():
+    """(now in the operator's timezone, its label). A named zone follows
+    daylight saving: the fixed offset said PDT all winter. The offset is only
+    the fallback for an image without tzdata."""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        local = now.astimezone(ZoneInfo(os.environ.get("GAIA_USER_TZ") or "America/Los_Angeles"))
+        return local, local.tzname()
+    except Exception:
+        return now.astimezone(timezone(timedelta(hours=LOCAL_TZ_OFFSET))), LOCAL_TZ_LABEL
+
 # ── Paths ────────────────────────────────────────────────────────────────────
 
 AWARENESS_DIR: str = os.environ.get("AWARENESS_DIR", "/knowledge/awareness")

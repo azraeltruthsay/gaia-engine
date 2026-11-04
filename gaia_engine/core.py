@@ -397,6 +397,19 @@ def _clean_response_text(text: str) -> str:
     return cleaned.strip()
 
 
+def _nf4_attention(model_path: str) -> str:
+    """Attention for an NF4 load. Gemma 4 needs eager: sdpa raises
+    normal_kernel_cuda errors on its Gemma4ClippableLinear layers. Eager on
+    Qwen3-VL grew until a 6,466-token prompt broke the worker, so everything else
+    gets sdpa."""
+    try:
+        with open(os.path.join(model_path, "config.json"), encoding="utf-8") as f:
+            model_type = json.load(f).get("model_type", "")
+    except (OSError, ValueError):
+        return "eager"  # unknown: the setting known to load
+    return "eager" if "gemma" in model_type else "sdpa"
+
+
 def _think_close_token_id(tokenizer) -> int:
     """Id of Qwen3's </think>, or -1 when the vocab has none (Gemma 4)."""
     try:
@@ -1229,7 +1242,7 @@ class GAIAEngine:
                     quantization_config=nf4_config,
                     device_map={"": 0},
                     low_cpu_mem_usage=True,
-                    attn_implementation="eager",
+                    attn_implementation=_nf4_attention(model_path),
                 )
                 _loaded = False
                 if self.has_vision:

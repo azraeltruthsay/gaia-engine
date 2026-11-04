@@ -1144,6 +1144,7 @@ class GAIAEngine:
         # Check if model is pre-quantized (AWQ/GPTQ) — these load directly
         # via transformers integration, no manual quantization needed
         is_prequantized = False
+        saved_nf4 = False  # weights already NF4: load as they are, no quantizing
         try:
             import json as _json
             config_path = Path(model_path) / "config.json"
@@ -1151,6 +1152,7 @@ class GAIAEngine:
                 cfg = _json.loads(config_path.read_text())
                 quant_cfg = cfg.get("quantization_config", {})
                 quant_method = quant_cfg.get("quant_method", "")
+                saved_nf4 = quant_method == "bitsandbytes" and quant_cfg.get("bnb_4bit_quant_type") == "nf4"
                 if quant_method in ("awq", "gptq"):
                     is_prequantized = True
                     logger.info("Detected pre-quantized model (%s) — loading directly", quant_method)
@@ -1187,7 +1189,7 @@ class GAIAEngine:
 
         # Estimate model size BEFORE loading to decide quantization strategy
         # (skip if already loaded via MoE offloading path above)
-        use_nf4 = os.environ.get("GAIA_ENGINE_QUANTIZE", "").lower() == "nf4"
+        use_nf4 = saved_nf4 or os.environ.get("GAIA_ENGINE_QUANTIZE", "").lower() == "nf4"
         if _moe_loaded:
             use_nf4 = True  # MoE path already used NF4
         elif use_nf4:
@@ -1263,6 +1265,10 @@ class GAIAEngine:
                     low_cpu_mem_usage=True,
                     attn_implementation=_nf4_attention(model_path),
                 )
+                if saved_nf4:
+                    # Bit-identical to quantizing on load, in about 4 s against 40.
+                    logger.info("Loading saved NF4 weights as they are")
+                    del _nf4_kwargs["quantization_config"]
                 _loaded = False
                 if self.has_vision:
                     try:

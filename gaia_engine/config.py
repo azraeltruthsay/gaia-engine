@@ -29,6 +29,9 @@ ENGINE_TIER: str = os.environ.get("GAIA_ENGINE_TIER", "prime")
 
 SAE_SAMPLE_RATE: int = int(os.environ.get("GAIA_SAE_SAMPLE_RATE", "4"))
 SAE_STREAM_EVERY_N: int = int(os.environ.get("GAIA_SAE_STREAM_EVERY_N", "8"))
+# The atlas recorded on this model's weights, read live into the activation stream.
+SAE_ATLAS_PATH: str = os.environ.get("GAIA_SAE_ATLAS", "")
+SAE_ATLAS_LAYERS: list = [int(x) for x in os.environ.get("GAIA_SAE_ATLAS_LAYERS", "12,24,35").split(",") if x.strip()]
 ACTIVATION_STREAM_PATH: str = os.environ.get("ACTIVATION_STREAM_PATH", "/logs/activation_stream.jsonl")
 
 # ── Prompt-shaping features ──────────────────────────────────────────────────

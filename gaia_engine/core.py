@@ -39,6 +39,8 @@ logger = logging.getLogger("GAIA.Engine")
 
 # ── Performance: configurable SAE sample rate ────────────────────────────────
 from gaia_engine.config import SAE_SAMPLE_RATE as _SAE_SAMPLE_RATE
+from gaia_engine.config import SAE_ATLAS_LAYERS as _SAE_ATLAS_LAYERS
+from gaia_engine.config import SAE_ATLAS_PATH as _SAE_ATLAS_PATH
 from gaia_engine.config import SAE_STREAM_EVERY_N as _SAE_STREAM_EVERY_N
 
 # Disable gradient computation globally for inference (not just per-call)
@@ -66,53 +68,47 @@ def _rotate_activation_stream(path: str, max_bytes: int = None) -> bool:
     return False
 
 
-def _write_activation(tier, token, token_idx, session_id, snapshot, sae=None, labels=None):
-    """Write per-token activation data to JSONL for live visualization.
+def _write_activation(tier, token, token_idx, session_id, snapshot, labels=None, turn_id="", model=""):
+    """Write per-token activation data to JSONL.
 
-    Called from generate_stream() after each token's forward pass when
-    the activation monitor is enabled.  The JSONL file is tailed by
-    gaia-web's SSE endpoint to drive the Neural Mind Map in real-time.
-
-    Never raises — inference must never crash for visualization.
+    Each sampled layer keeps its own values, so a loud deep layer can't crowd out
+    an early one (ranked together, layers up to 16 appeared on 0.3% of Prime's
+    tokens): `n` loudest neurons, and where an atlas covers the layer, `z` neurons
+    furthest from their usual level and `f` SAE features. `features` is the short
+    list the Neural Mind Map draws. Never raises: inference must not crash for this.
     """
     from datetime import datetime, timezone
 
-    features = []
-    if sae and snapshot:
-        # SAE decomposition into interpretable features
-        for layer_key, layer_data in snapshot.items():
-            try:
-                layer_idx = int(layer_key.split("_")[1])
-            except (IndexError, ValueError):
-                continue
-            for idx, val in zip(layer_data.get("top_5_indices", []),
-                                layer_data.get("top_5_values", [])):
-                label = (labels or {}).get(layer_idx, {}).get(int(idx), f"feature_{idx}")
-                features.append({"idx": int(idx), "strength": float(val),
-                                 "label": label, "layer": layer_idx})
-    elif snapshot:
-        # No SAE — use raw polygraph top activations
-        for layer_key, layer_data in snapshot.items():
-            try:
-                layer_idx = int(layer_key.split("_")[1])
-            except (IndexError, ValueError):
-                continue
-            for idx, val in zip(layer_data.get("top_5_indices", []),
-                                layer_data.get("top_5_values", [])):
-                features.append({"idx": int(idx), "strength": float(val),
-                                 "label": f"neuron_{idx}", "layer": layer_idx})
-
-    # Sort by strength, keep top 10
+    features, layers = [], {}
+    for layer_key, data in (snapshot or {}).items():
+        try:
+            layer_idx = int(layer_key.split("_")[1])
+        except (IndexError, ValueError):
+            continue
+        neurons = [[int(i), float(v)] for i, v in zip(data.get("top_5_indices", []), data.get("top_5_values", []))]
+        row = {"l2": data.get("l2_norm"), "n": neurons}
+        for key in ("z", "f"):
+            if data.get(key):
+                row[key] = data[key]
+        layers[str(layer_idx)] = row
+        names = (labels or {}).get(layer_idx, {})
+        if data.get("f"):
+            features += [{"idx": i, "strength": v, "layer": layer_idx, "label": names.get(i, f"feature_{i}")}
+                         for i, v in data["f"][:3]]
+        else:
+            features += [{"idx": i, "strength": v, "layer": layer_idx, "label": f"neuron_{i}"} for i, v in neurons[:1]]
     features.sort(key=lambda f: f["strength"], reverse=True)
-    features = features[:10]
 
     line = json.dumps({
         "ts": datetime.now(timezone.utc).isoformat(),
         "tier": tier,
+        "model": model,
         "token": token,
         "token_idx": token_idx,
         "session_id": session_id or "",
-        "features": features,
+        "turn_id": turn_id or "",
+        "features": features[:10],
+        "layers": layers,
     })
 
     try:
@@ -174,6 +170,23 @@ class StaticKVCache:
 
 # ── Activation Monitor ───────────────────────────────────────────────────────
 
+def _read_with_atlas(last_token, sae: dict, k: int = 5) -> dict:
+    """One layer read through its SAE, the way sae_trainer encodes: normalize, encode,
+    rectify. The norm stats are also each neuron's usual level, so `z` shows what is
+    unusual for this token rather than what is always loud."""
+    x = last_token.to(dtype=sae["encoder_weight"].dtype)
+    norm = (x - sae["norm_mean"]) / sae["norm_std"]
+    z = norm.abs().topk(k)
+    f = torch.relu(sae["encoder_weight"] @ norm + sae["encoder_bias"]).topk(k)
+    # float32 holds every index exactly; bfloat16 would round 4097 to another neuron.
+    z_idx, z_val, f_idx, f_val = torch.stack(
+        [z.indices.float(), norm[z.indices].float(), f.indices.float(), f.values.float()]).cpu().tolist()
+    return {
+        "z": [[int(i), round(v, 2)] for i, v in zip(z_idx, z_val)],
+        "f": [[int(i), round(v, 3)] for i, v in zip(f_idx, f_val) if v > 0],
+    }
+
+
 class ActivationMonitor:
     """Real-time activation monitoring during inference."""
 
@@ -183,7 +196,7 @@ class ActivationMonitor:
         self._last_timestamp: float = 0.0
         self._captures: int = 0
 
-    def capture(self, hidden_states: tuple, sample_every: int = None) -> dict:
+    def capture(self, hidden_states: tuple, sample_every: int = None, atlas: dict = None) -> dict:
         """Capture activation snapshot from selected layers.
 
         Args:
@@ -203,18 +216,24 @@ class ActivationMonitor:
         snapshot = {}
 
         if isinstance(hidden_states, dict):
-            # Pre-filtered dict from selective capture: {layer_idx: tensor}
-            for idx, hs in hidden_states.items():
-                last_token = hs[0, -1, :]
-                abs_vals = last_token.abs()
-                top5 = abs_vals.topk(5)
+            # Pre-filtered dict from selective capture: {layer_idx: tensor}. Every
+            # layer is read in one transfer: taken one float at a time, the GPU
+            # stalls dozens of times per token (45 -> 26 tok/s logging each token).
+            layer_ids = list(hidden_states)
+            last = torch.stack([hidden_states[i][0, -1, :] for i in layer_ids]).float()
+            top = last.abs().topk(5, dim=-1)
+            stats = torch.stack([last.mean(-1), last.std(-1), last.norm(dim=-1)], dim=-1).cpu().tolist()
+            top_idx, top_val = top.indices.cpu().tolist(), top.values.cpu().tolist()
+            for n, idx in enumerate(layer_ids):
                 snapshot[f"layer_{idx}"] = {
-                    "mean": float(last_token.mean()),
-                    "std": float(last_token.std()),
-                    "l2_norm": float(last_token.norm()),
-                    "top_5_indices": top5.indices.tolist(),
-                    "top_5_values": [round(float(v), 4) for v in top5.values],
+                    "mean": stats[n][0],
+                    "std": stats[n][1],
+                    "l2_norm": stats[n][2],
+                    "top_5_indices": top_idx[n],
+                    "top_5_values": [round(v, 4) for v in top_val[n]],
                 }
+                if atlas and idx in atlas:
+                    snapshot[f"layer_{idx}"].update(_read_with_atlas(last[n], atlas[idx]))
         else:
             # Full tuple — sample every Nth layer
             num_layers = len(hidden_states)
@@ -1496,6 +1515,8 @@ class GAIAEngine:
 
         elapsed = time.time() - start
         mem_mb = torch.cuda.memory_allocated() // (1024 * 1024) if device == "cuda" else 0
+        if _SAE_ATLAS_PATH and self.device == "cuda":
+            self.load_sae_atlas(_SAE_ATLAS_PATH, _SAE_ATLAS_LAYERS)
         logger.info("GAIA Engine ready in %.1fs (VRAM: %dMB)", elapsed, mem_mb)
 
     # ── Adapter Management ───────────────────────────────────────────
@@ -1674,59 +1695,41 @@ class GAIAEngine:
             "base_model": self.model_path,
         }
 
-    def load_sae_atlas(self, path: str) -> dict:
-        """Load pre-trained SAE weights and feature labels for live decomposition.
+    def load_sae_atlas(self, path: str, layers=None) -> dict:
+        """Load an atlas's SAE encoders and concept names for the activation stream.
 
-        Expects a directory with:
-          - meta.json  — model name, timestamp, optional inline labels
-          - layer_N_labels.json — per-layer feature label mappings
-
-        The loaded labels are used by ``_write_activation()`` to annotate
-        features in the JSONL stream with human-readable names.
+        `path` holds layer_N.pt from sae_trainer and analysis.json. Only `layers` go
+        on the device (each encoder is ~70 MB), and they join the sampled layers. A
+        concept names a feature only where the atlas's analysis found it, on the
+        analysis layer. An atlas for other weights would mean nothing: the caller
+        chooses the one recorded on this model.
         """
         atlas_path = Path(path)
-        meta_file = atlas_path / "meta.json"
-        labels: Dict[int, Dict[int, str]] = {}
-
+        wanted = set(layers or [])
+        atlas, labels = {}, {}
         try:
-            if meta_file.exists():
-                meta = json.loads(meta_file.read_text())
-                # Inline labels in meta.json: {layers: {0: {features: {42: "greeting"}}}}
-                for layer_key, layer_data in meta.get("layers", {}).items():
-                    try:
-                        layer_idx = int(layer_key)
-                        features = layer_data.get("features", {})
-                        labels[layer_idx] = {int(k): v for k, v in features.items()}
-                    except (ValueError, AttributeError):
-                        continue
-
-            # Per-layer label files override meta.json
-            for entry in atlas_path.iterdir():
-                if entry.name.startswith("layer_") and entry.name.endswith("_labels.json"):
-                    try:
-                        layer_idx = int(entry.name.split("_")[1])
-                        layer_labels = json.loads(entry.read_text())
-                        if layer_idx not in labels:
-                            labels[layer_idx] = {}
-                        labels[layer_idx].update({int(k): v for k, v in layer_labels.items()})
-                    except (ValueError, json.JSONDecodeError):
-                        continue
-
-            # Load SAE .pt weights if present
-            sae_weights = {}
-            for entry in atlas_path.iterdir():
-                if entry.suffix == ".pt":
-                    try:
-                        sae_weights[entry.stem] = torch.load(entry, map_location="cpu", weights_only=True)
-                    except Exception as e:
-                        logger.warning("Failed to load SAE weights %s: %s", entry.name, e)
-
-            self._sae_atlas = sae_weights if sae_weights else None
+            for layer_idx in sorted(wanted):
+                file = atlas_path / f"layer_{layer_idx}.pt"
+                if not file.exists():
+                    logger.warning("SAE atlas %s has no layer %d", path, layer_idx)
+                    continue
+                d = torch.load(file, map_location="cpu", weights_only=False)
+                dtype = torch.bfloat16 if self.device == "cuda" else torch.float32
+                atlas[layer_idx] = {k: d[k].to(self.device, dtype=dtype)
+                                    for k in ("encoder_weight", "encoder_bias", "norm_mean", "norm_std")}
+            analysis_file = atlas_path / "analysis.json"
+            if analysis_file.exists():
+                analysis = json.loads(analysis_file.read_text())
+                names = labels.setdefault(int(analysis.get("analysis_layer", -1)), {})
+                for concept, found in (analysis.get("domain_features") or {}).items():
+                    for item in found:
+                        names.setdefault(int(item["index"]), concept)
+            self._sae_atlas = atlas or None
             self._sae_labels = labels
-            logger.info("SAE atlas loaded from %s: %d layers with labels, %d weight files",
-                        path, len(labels), len(sae_weights))
-            return {"ok": True, "layers": len(labels), "weights": len(sae_weights)}
-
+            self._sae_target_layers |= set(atlas)
+            logger.info("SAE atlas loaded from %s: layers %s, %d named features",
+                        path, sorted(atlas), sum(len(v) for v in labels.values()))
+            return {"ok": bool(atlas), "layers": sorted(atlas), "named": sum(len(v) for v in labels.values())}
         except Exception as e:
             logger.warning("Failed to load SAE atlas from %s: %s", path, e)
             return {"ok": False, "error": str(e)}
@@ -2008,7 +2011,8 @@ class GAIAEngine:
                  enable_thinking: bool = True,
                  repetition_penalty: float = 1.1,
                  stop=None, include_stop_str_in_output: bool = False,
-                 native_thinking: bool = False) -> dict:
+                 native_thinking: bool = False,
+                 session_id: str = "", turn_id: str = "") -> dict:
         """Generate a chat completion with full introspection.
 
         Args:
@@ -2312,10 +2316,10 @@ class GAIAEngine:
 
             if capture and hasattr(out, "hidden_states") and out.hidden_states:
                 filtered = self._extract_target_hidden_states(out.hidden_states)
-                snapshot = self.monitor.capture(filtered)
+                snapshot = self.monitor.capture(filtered, atlas=self._sae_atlas)
                 if snapshot:
-                    _write_activation(ENGINE_TIER, "<prompt>", 0, "",
-                                      snapshot, self._sae_atlas, self._sae_labels)
+                    _write_activation(ENGINE_TIER, "<prompt>", 0, session_id,
+                                      snapshot, self._sae_labels, turn_id, self.model_path)
             del out  # Free full output immediately
 
             # Autoregressive loop — minimal overhead, with entropy tracking
@@ -2427,13 +2431,13 @@ class GAIAEngine:
 
                 if _need_hidden and hasattr(out, "hidden_states") and out.hidden_states:
                     filtered = self._extract_target_hidden_states(out.hidden_states)
-                    snapshot = self.monitor.capture(filtered)
+                    snapshot = self.monitor.capture(filtered, atlas=self._sae_atlas)
                     if snapshot:
                         _write_activation(
                             ENGINE_TIER,
                             self.tokenizer.decode([token]),
-                            step + 1, "",
-                            snapshot, self._sae_atlas, self._sae_labels)
+                            step + 1, session_id,
+                            snapshot, self._sae_labels, turn_id, self.model_path)
                 del out
 
             # Decode (the native thought channel, if any, travels separately
@@ -2512,7 +2516,7 @@ class GAIAEngine:
                          temperature: float = 0.7, top_p: float = 0.9,
                          session_id: str = "", stop=None,
                          include_stop_str_in_output: bool = False,
-                         native_thinking: bool = False):
+                         native_thinking: bool = False, turn_id: str = ""):
         """Generate a chat completion with per-token streaming.
 
         Yields dicts with delta content for each token, compatible with
@@ -2632,10 +2636,10 @@ class GAIAEngine:
             # Capture initial hidden states if monitor enabled
             if _capture and hasattr(out, "hidden_states") and out.hidden_states:
                 filtered = self._extract_target_hidden_states(out.hidden_states)
-                snapshot = self.monitor.capture(filtered)
+                snapshot = self.monitor.capture(filtered, atlas=self._sae_atlas)
                 if snapshot:
                     _write_activation(_tier, "<prompt>", 0, session_id,
-                                      snapshot, self._sae_atlas, self._sae_labels)
+                                      snapshot, self._sae_labels, turn_id, self.model_path)
             del out  # Free full output immediately
 
             generated = []
@@ -2708,11 +2712,11 @@ class GAIAEngine:
                 # Write activation snapshot for sampled tokens only
                 if _need_hidden and hasattr(out, "hidden_states") and out.hidden_states:
                     filtered = self._extract_target_hidden_states(out.hidden_states)
-                    snapshot = self.monitor.capture(filtered)
+                    snapshot = self.monitor.capture(filtered, atlas=self._sae_atlas)
                     if snapshot:
                         _write_activation(_tier, delta or self.tokenizer.decode([token]),
                                           step + 1, session_id,
-                                          snapshot, self._sae_atlas, self._sae_labels)
+                                          snapshot, self._sae_labels, turn_id, self.model_path)
                 del out  # Free output each step
 
             if _stops:
@@ -3050,7 +3054,8 @@ class EngineHandler(BaseHTTPRequestHandler):
                         b.get("temperature", 0.7), b.get("top_p", 0.9),
                         stop=b.get("stop"),
                         include_stop_str_in_output=bool(b.get("include_stop_str_in_output")),
-                        native_thinking=bool((b.get("chat_template_kwargs") or {}).get("native_thinking"))):
+                        native_thinking=bool((b.get("chat_template_kwargs") or {}).get("native_thinking")),
+                        session_id=b.get("session_id", ""), turn_id=b.get("turn_id", "")):
                         self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
                         self.wfile.flush()
                     self.wfile.write(b"data: [DONE]\n\n")
@@ -3076,7 +3081,8 @@ class EngineHandler(BaseHTTPRequestHandler):
                         include_stop_str_in_output=bool(b.get("include_stop_str_in_output")),
                         # explicit opt-in: the client defaults enable_thinking
                         # to True on every request, so it can't mean "think"
-                        native_thinking=bool(_template_kwargs.get("native_thinking")))
+                        native_thinking=bool(_template_kwargs.get("native_thinking")),
+                        session_id=b.get("session_id", ""), turn_id=b.get("turn_id", ""))
                     self._json(result)
             except GPUUnavailableError as e:
                 # Distinct from a normal generation error (500) so the

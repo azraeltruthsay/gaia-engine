@@ -151,6 +151,8 @@ class EngineManager:
         self._own_cuda_masked = False
         self.event_callback = event_callback
         self._lock = threading.Lock()
+        self._respawn_lock = threading.Lock()
+        self._last_respawn = 0.0
         # Inference queue: limits concurrent requests to the worker.
         # Additional requests block until a slot opens. Prevents overwhelming
         # the model with rapid-fire Discord messages.
@@ -452,6 +454,40 @@ class EngineManager:
             logger.warning("Migration to %s failed: %s", target, e)
             return {"ok": False, "error": str(e)}
 
+    def respawn_wedged_worker(self, detail: str = "") -> bool:
+        """Restart a worker whose CUDA context is wedged (pqpo, 2026-11-06).
+
+        A device-side assert can't be cleared in-process; until now the
+        worker kept answering 500 until someone restarted the container. A
+        fresh process gets a fresh context, and the same model is loaded
+        again. At most once a minute, in the background."""
+        import time as _time
+        with self._lock:
+            model, device = self.model_path, self.device
+        if not model or not self._respawn_lock.acquire(blocking=False):
+            return False
+        if _time.time() - self._last_respawn < 60:
+            self._respawn_lock.release()
+            return False
+        self._last_respawn = _time.time()
+        logger.error("Worker CUDA context wedged (%s): restarting it with %s", detail[:200], model)
+
+        def _run():
+            try:
+                self._draining = False
+                self._drain_event.set()
+                self._active_inference_count = 0
+                self.stop_worker()
+                result = self.start_worker(model, device or "cuda")
+                logger.info("Wedged worker replaced: %s", {k: result.get(k) for k in ("ok", "error") if k in result})
+            except Exception:
+                logger.exception("Respawning the wedged worker failed")
+            finally:
+                self._respawn_lock.release()
+
+        threading.Thread(target=_run, name="respawn-wedged-worker", daemon=True).start()
+        return True
+
     def cancel_inference(self, respawn: bool = True) -> dict:
         """Cancel active generation by killing and optionally respawning the worker.
 
@@ -574,6 +610,16 @@ class EngineManager:
                         return (resp.status, resp_headers, resp_body)
                 except URLError as e:
                     last_error = e
+                    # The worker answered 503 GPU-DEAD: a GPU fault (pqpo)
+                    # wedged it. Replace it rather than serve errors forever.
+                    if getattr(e, "code", None) == 503:
+                        try:
+                            err_body = e.read() or b""
+                        except Exception:
+                            err_body = b""
+                        if b"GAIA-ENGINE-GPU-DEAD" in err_body:
+                            self.respawn_wedged_worker(err_body.decode("utf-8", "replace")[:200])
+                            return (503, {"Content-Type": "application/json"}, err_body)
                     # Worker might have crashed
                     if self.worker_process and self.worker_process.poll() is not None:
                         exit_code = self.worker_process.returncode
@@ -630,6 +676,8 @@ class EngineManager:
             # GPU context -- its verdict outranks anything we can see here.
             if data["cuda_healthy"] is False:
                 data["status"] = "degraded"
+                if "wedged" in str(data.get("cuda_detail", "")):
+                    data["respawning"] = self.respawn_wedged_worker(str(data.get("cuda_detail", "")))
         elif device == "cuda" and self._own_cuda_masked:
             # No worker verdict (llama-server worker, or proxy skipped during
             # active inference) and our own view is masked: unverifiable, not

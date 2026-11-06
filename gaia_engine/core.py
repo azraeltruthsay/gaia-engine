@@ -577,6 +577,25 @@ class ChatFormatter:
         return ids
 
 
+def _strip_injected_lora(model) -> int:
+    """Replace PEFT LoRA wrappers left in `model` by their base layers, and drop
+    the peft_config PEFT sets on it. Returns how many layers were unwrapped."""
+    count = 0
+    for parent in list(model.modules()):
+        for child_name, child in list(parent._modules.items()):
+            base = getattr(child, "base_layer", None)
+            if base is not None and hasattr(child, "lora_A"):
+                parent._modules[child_name] = base
+                count += 1
+    for obj in (model, getattr(model, "model", None)):
+        if obj is not None and hasattr(obj, "peft_config"):
+            try:
+                delattr(obj, "peft_config")
+            except AttributeError:
+                pass
+    return count
+
+
 class GPUUnavailableError(RuntimeError):
     """Raised when an engine instance expects CUDA but the driver context is
     dead (e.g. a stale context left behind by a host reboot — GAIA_Project-t0f2).
@@ -593,6 +612,27 @@ class GPUUnavailableError(RuntimeError):
     """
 
 
+# Set once a kernel fails on the GPU (pqpo, 2026-11-06). A device-side assert
+# leaves the CUDA context unusable for the life of the process, yet
+# torch.cuda.is_available() stays True: health said "ok" while every request
+# failed with 500 until someone restarted the container.
+_CUDA_WEDGED: Optional[str] = None
+_CUDA_FAILURE_RE = re.compile(r"device-side assert|CUDA error|cudaError|illegal memory access", re.IGNORECASE)
+
+
+def note_cuda_failure(exc: BaseException) -> bool:
+    """Whether `exc` is a GPU fault that wedges this process's CUDA context.
+    If so it is remembered, health reports it, and the next request fails fast."""
+    global _CUDA_WEDGED
+    text = f"{type(exc).__name__}: {exc}"
+    if type(exc).__name__ != "AcceleratorError" and not _CUDA_FAILURE_RE.search(text):
+        return False
+    if _CUDA_WEDGED is None:
+        _CUDA_WEDGED = text.splitlines()[0][:300]
+        logger.error("CUDA context wedged, this worker needs a restart: %s", _CUDA_WEDGED)
+    return True
+
+
 def cuda_health_snapshot(device: str) -> Tuple[bool, str]:
     """Non-raising CUDA health check, for health-check/observability callers
     (GAIA_Project-t0f2) that want to REPORT a dead GPU rather than fail a
@@ -606,6 +646,8 @@ def cuda_health_snapshot(device: str) -> Tuple[bool, str]:
     """
     if device != "cuda":
         return True, f"device={device!r} — CUDA not expected"
+    if _CUDA_WEDGED:
+        return False, f"CUDA context wedged by an earlier GPU fault: {_CUDA_WEDGED}"
     try:
         if torch.cuda.is_available():
             return True, "cuda available"
@@ -1586,6 +1628,17 @@ class GAIAEngine:
                         "loaded_adapters": list(self._adapters.keys())}
             except Exception as e:
                 logger.exception("Failed to load adapter '%s'", name)
+                if self._peft_model is None:
+                    # pqpo: from_pretrained injects LoRA layers into the base
+                    # model before loading weights. A mismatched adapter (one
+                    # trained for another model) fails after that, and the
+                    # half-built layers stayed: the next generation sampled
+                    # from inf/nan and wedged CUDA. Put the base model back.
+                    stripped = _strip_injected_lora(self._base_model)
+                    self.model = self._base_model
+                    self._drop_decode_graphs()
+                    if stripped:
+                        logger.warning("Removed %d half-loaded LoRA layers after the failed load", stripped)
                 return {"ok": False, "error": str(e)}
 
     def unload_adapter(self, name: str) -> Dict:
@@ -3104,7 +3157,10 @@ class EngineHandler(BaseHTTPRequestHandler):
                 self._json({"error": str(e), "error_code": "GAIA-ENGINE-GPU-DEAD"}, 503)
             except Exception as e:
                 logger.exception("Generation failed")
-                self._json({"error": str(e)}, 500)
+                if note_cuda_failure(e):
+                    self._json({"error": str(e), "error_code": "GAIA-ENGINE-GPU-DEAD"}, 503)
+                else:
+                    self._json({"error": str(e)}, 500)
             finally:
                 if _engine is not None:
                     _release_cached_vram(_engine.device)

@@ -131,7 +131,10 @@ class GaiaCppBackendAdapter:
         n_threads: int = 8,
         capture_layers: Optional[List[int]] = None,
         tier: str = "prime",
+        prompt_format: str = "house",
     ):
+        from gaia_engine.prompt_format import normalize
+        self.prompt_format = normalize(prompt_format)
         if not _CPP_AVAILABLE:
             raise RuntimeError("gaia_cpp C++ extension not available in this environment")
 
@@ -461,6 +464,10 @@ class GaiaCppBackendAdapter:
         assistant start token to suppress chain-of-thought mode.
         """
         is_gemma = self._family() == "gemma"
+
+        if is_gemma and getattr(self, "prompt_format", "house") == "stock":
+            from gaia_engine.prompt_format import stock_gemma4
+            return stock_gemma4(messages, enable_thinking=enable_thinking)
 
         if is_gemma:
             parts = []

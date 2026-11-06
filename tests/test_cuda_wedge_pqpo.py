@@ -67,14 +67,15 @@ def test_the_manager_replaces_a_wedged_worker(monkeypatch):
         "status": "ok", "device": "cuda", "cuda_healthy": False,
         "cuda_detail": "CUDA context wedged by an earlier GPU fault: AcceleratorError"})
     monkeypatch.setattr(m, "stop_worker", lambda: calls.append("stop") or {"ok": True})
-    monkeypatch.setattr(m, "start_worker", lambda path, device="cuda": calls.append(("start", path, device)) or {"ok": True})
+    monkeypatch.setattr(m, "start_worker", lambda path, device="cuda", **kw: calls.append(("start", path, device, kw.get("prompt_format"))) or {"ok": True})
+    m._prompt_format = "stock"  # a respawn keeps the model's prompt format
     data = m.health_response()
     assert data["status"] == "degraded" and data["respawning"] is True
     for _ in range(50):
         if len(calls) == 2:
             break
         import time; time.sleep(0.02)
-    assert calls == ["stop", ("start", "/models/prime-nf4", "cuda")]
+    assert calls == ["stop", ("start", "/models/prime-nf4", "cuda", "stock")]
     # Once a minute at most: a worker that wedges again isn't restarted in a loop.
     assert m.health_response()["respawning"] is False
 

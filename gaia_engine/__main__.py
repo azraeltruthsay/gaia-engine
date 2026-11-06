@@ -22,6 +22,8 @@ def main():
     p.add_argument("--compile", default="reduce-overhead",
                    choices=["reduce-overhead", "max-autotune", "none"])
     p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--prompt-format", default="house", choices=["house", "stock"],
+                   help="Gemma 4 turn format: GAIA's trained house format, or Google's stock one")
     p.add_argument("--managed", action="store_true",
                    help="Start in managed mode — zero GPU, subprocess isolation")
     args = p.parse_args()
@@ -35,7 +37,7 @@ def main():
         if not args.model:
             p.error("--model is required in direct mode (or use --managed)")
         from gaia_engine.core import serve
-        serve(args.model, args.port, args.device, getattr(args, "compile"), args.host)
+        serve(args.model, args.port, args.device, getattr(args, "compile"), args.host, args.prompt_format)
 
 
 if __name__ == "__main__":

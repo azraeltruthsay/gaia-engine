@@ -152,6 +152,7 @@ class EngineManager:
         self.event_callback = event_callback
         self._lock = threading.Lock()
         self._respawn_lock = threading.Lock()
+        self._prompt_format = "house"
         self._last_respawn = 0.0
         # Inference queue: limits concurrent requests to the worker.
         # Additional requests block until a slot opens. Prevents overwhelming
@@ -174,13 +175,14 @@ class EngineManager:
 
     def start_worker(self, model_path: str, device: str = "cuda",
                      compile_mode: str = "reduce-overhead",
-                     quantize: str = "") -> dict:
+                     quantize: str = "", prompt_format: str = "house") -> dict:
         """Spawn a worker subprocess with the GAIA Engine.
 
         If model_path ends in .gguf, spawns llama-server instead of the
         Python engine. This provides fast CPU inference for GGUF models
         with the same OpenAI-compatible API.
         """
+        self._prompt_format = prompt_format  # kept for respawns (cancel, wedged GPU)
         with self._lock:
             if self.worker_process is not None:
                 return {"ok": False, "error": "model already loaded — unload first or use /model/swap"}
@@ -223,6 +225,7 @@ class EngineManager:
                             n_ctx=ctx_size,
                             n_threads=threads,
                             tier=tier,
+                            prompt_format=prompt_format,
                         )
                         self._cpp_backend = cpp
                         self.worker_port = None
@@ -258,6 +261,7 @@ class EngineManager:
                     "--device", device,
                     "--compile", compile_mode,
                     "--host", "127.0.0.1",
+                    "--prompt-format", prompt_format if prompt_format in ("house", "stock") else "house",
                 ]
 
             env = os.environ.copy()
@@ -478,7 +482,7 @@ class EngineManager:
                 self._drain_event.set()
                 self._active_inference_count = 0
                 self.stop_worker()
-                result = self.start_worker(model, device or "cuda")
+                result = self.start_worker(model, device or "cuda", prompt_format=self._prompt_format)
                 logger.info("Wedged worker replaced: %s", {k: result.get(k) for k in ("ok", "error") if k in result})
             except Exception:
                 logger.exception("Respawning the wedged worker failed")
@@ -510,7 +514,7 @@ class EngineManager:
         self.stop_worker()
 
         if respawn and model:
-            result = self.start_worker(model, device or "cuda")
+            result = self.start_worker(model, device or "cuda", prompt_format=self._prompt_format)
             result["cancelled"] = True
             return result
         return {"ok": True, "cancelled": True, "respawned": False}
@@ -536,14 +540,14 @@ class EngineManager:
 
     def swap_worker(self, model_path: str, device: str = "cuda",
                     compile_mode: str = "reduce-overhead",
-                    quantize: str = "") -> dict:
+                    quantize: str = "", prompt_format: str = "house") -> dict:
         """Swap models: drain, kill old worker, spawn new one. The drain stops
         a direct /model/swap from cutting a live generation (sy0s)."""
         old_model = self.model_path
         owner = self._begin_drain()
         try:
             self.stop_worker()
-            result = self.start_worker(model_path, device, compile_mode, quantize)
+            result = self.start_worker(model_path, device, compile_mode, quantize, prompt_format)
         finally:
             if owner:
                 self.resume()
@@ -1225,7 +1229,8 @@ class ManagedEngineHandler(BaseHTTPRequestHandler):
             device = b.get("device", "cuda")
             compile_mode = b.get("compile_mode", "reduce-overhead")
             quantize = b.get("quantize", "")
-            result = self.manager.start_worker(model_path, device, compile_mode, quantize)
+            result = self.manager.start_worker(model_path, device, compile_mode, quantize,
+                                               b.get("prompt_format", "house"))
             status = 200 if result.get("ok") else 500
             if "already loaded" in result.get("error", ""):
                 status = 409
@@ -1243,7 +1248,8 @@ class ManagedEngineHandler(BaseHTTPRequestHandler):
             device = b.get("device", "cuda")
             compile_mode = b.get("compile_mode", "reduce-overhead")
             quantize = b.get("quantize", "")
-            result = self.manager.swap_worker(model_path, device, compile_mode, quantize)
+            result = self.manager.swap_worker(model_path, device, compile_mode, quantize,
+                                              b.get("prompt_format", "house"))
             status = 200 if result.get("ok") else 500
             self._json(result, status)
 

@@ -477,8 +477,10 @@ class ChatFormatter:
     - Fallback: ChatML (safe default for unknown models)
     """
 
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, prompt_format: str = "house"):
+        from gaia_engine.prompt_format import normalize
         self.tokenizer = tokenizer
+        self.prompt_format = normalize(prompt_format)
         self.family = self._detect_family()
         logger.info("ChatFormatter: detected model family '%s'", self.family)
 
@@ -502,6 +504,9 @@ class ChatFormatter:
 
     def format_message(self, role: str, content: str) -> str:
         """Format a single message with role tags."""
+        if self.family == "gemma4" and self.prompt_format == "stock":
+            role = {"assistant": "model", "developer": "system"}.get(role, role)
+            return f"<|turn>{role}\n{content}<turn|>"
         if self.family == "gemma4":
             return f"<|turn>{role}<turn|>\n{content}"
         return f"<|im_start|>{role}\n{content}<|im_end|>"
@@ -517,6 +522,8 @@ class ChatFormatter:
         Thinking template does: prime_thinking_v1 learned to write <think>
         itself, and when sampling skipped that first token it never thought.
         """
+        if self.family == "gemma4" and self.prompt_format == "stock":
+            return "<|turn>model\n" + ("" if enable_thinking else "<|channel>thought\n<channel|>")
         if self.family == "gemma4":
             prefix = "<|turn>assistant<turn|>\n"
             if not enable_thinking:
@@ -540,6 +547,10 @@ class ChatFormatter:
             enable_thinking: Whether to allow model thinking
             add_generation_prompt: Whether to append assistant prefix for generation
         """
+        if self.family == "gemma4" and self.prompt_format == "stock":
+            from gaia_engine.prompt_format import stock_gemma4
+            return stock_gemma4(messages, enable_thinking=enable_thinking,
+                                add_generation_prompt=add_generation_prompt)
         parts = []
         for msg in messages:
             parts.append(self.format_message(msg["role"], msg.get("content", "")))
@@ -1132,8 +1143,10 @@ class GAIAEngine:
     """
 
     def __init__(self, model_path: str, device: str = "cuda",
-                 dtype=torch.bfloat16, compile_mode: str = "reduce-overhead"):
+                 dtype=torch.bfloat16, compile_mode: str = "reduce-overhead",
+                 prompt_format: str = "house"):
         self.model_path = model_path
+        self.prompt_format = prompt_format
         # Normalize device: orchestrator uses "gpu", PyTorch needs "cuda"
         if device == "gpu":
             device = "cuda"
@@ -1503,7 +1516,7 @@ class GAIAEngine:
             pass
 
         # Initialize subsystems
-        self.formatter = ChatFormatter(self.tokenizer)
+        self.formatter = ChatFormatter(self.tokenizer, getattr(self, "prompt_format", "house"))
         self.prefix_cache = PrefixCache(self.model, self.tokenizer, device,
                                         formatter=self.formatter)
 
@@ -3490,13 +3503,14 @@ class EngineHandler(BaseHTTPRequestHandler):
 
 
 def serve(model_path: str, port: int = 8092, device: str = "cuda",
-          compile_mode: str = "reduce-overhead", host: str = "0.0.0.0"):
+          compile_mode: str = "reduce-overhead", host: str = "0.0.0.0",
+          prompt_format: str = "house"):
     """Start the GAIA Inference Engine."""
     global _engine
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
-    _engine = GAIAEngine(model_path, device=device, compile_mode=compile_mode)
+    _engine = GAIAEngine(model_path, device=device, compile_mode=compile_mode, prompt_format=prompt_format)
 
     server = HTTPServer((host, port), EngineHandler)
     logger.info("GAIA Inference Engine serving on %s:%d", host, port)

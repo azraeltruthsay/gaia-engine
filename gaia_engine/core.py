@@ -1289,6 +1289,8 @@ class GAIAEngine:
                     skip_modules.extend([
                         # Gemma 4 names
                         "vision_tower", "audio_tower", "embed_vision", "embed_audio",
+                        # Gemma 4 12B unified (encoder-free): patches -> features (2026-11-07)
+                        "vision_embedder",
                         # Qwen3-VL / Qwen2-VL names
                         "visual", "vision_model",
                     ])
@@ -1398,9 +1400,11 @@ class GAIAEngine:
         # all read `weight.dtype` via torch.finfo() in their forward, which
         # raises TypeError on uint8. Dequantize in-place to bf16 nn.Linear
         # so audio inference works. No-op if model was loaded in bf16.
-        if use_nf4 and hasattr(self.model, "model") and \
-                hasattr(self.model.model, "audio_tower") and \
-                self.model.model.audio_tower is not None:
+        # The 12B unified model has no audio_tower, only embed_audio, which this
+        # used to skip and leave in NF4 (2026-11-07).
+        if use_nf4 and hasattr(self.model, "model") and (
+                getattr(self.model.model, "audio_tower", None) is not None
+                or getattr(self.model.model, "embed_audio", None) is not None):
             try:
                 import bitsandbytes as _bnb
                 import bitsandbytes.functional as _bnb_f
@@ -1461,7 +1465,7 @@ class GAIAEngine:
 
                 to_replace = []
                 for name, mod in self.model.named_modules():
-                    if "vision_tower" not in name and "embed_vision" not in name:
+                    if "vision_tower" not in name and "embed_vision" not in name and "vision_embedder" not in name:
                         continue
                     for an, ch in list(mod.named_children()):
                         if isinstance(ch, _bnb.nn.Linear4bit):
@@ -1854,7 +1858,25 @@ class GAIAEngine:
                         return True
         return False
 
-    def _prepare_audio_inputs(self, messages: list) -> dict:
+    def _with_bos(self, text: str) -> str:
+        """The prompt text with <bos> in front when the processor won't add it.
+        Gemma 4 E4B's processor adds it; the 12B unified one doesn't, and
+        without it every image and audio answer came back garbled ("border
+        spaner surfing on a blue water mountain") while the text path, which
+        tokenizes with special tokens, was fine (2026-11-07)."""
+        tok = getattr(self.processor, "tokenizer", None) or getattr(self, "tokenizer", None)
+        bos = getattr(tok, "bos_token", None)
+        if not bos or text.startswith(bos):
+            return text
+        try:
+            ids = self.processor(text=["x"], return_tensors="pt")["input_ids"][0].tolist()
+            if ids and ids[0] == tok.bos_token_id:
+                return text
+        except Exception:
+            pass
+        return bos + text
+
+    def _prepare_audio_inputs(self, messages: list, enable_thinking: bool = True) -> dict:
         """Process multimodal messages with audio through the Gemma 4 audio
         processor. Returns dict with input_ids, attention_mask, plus the
         audio-specific tensors (input_features, input_features_mask) ready
@@ -1958,12 +1980,16 @@ class GAIAEngine:
         if not audios:
             raise ValueError("_prepare_audio_inputs called but no audio found in messages")
 
-        text_parts.append(self.formatter.assistant_prefix(enable_thinking=True))
+        # The request's thinking setting, as on the text path (2026-11-07): always
+        # True gave a stock Gemma 4 a thought channel, and a house-trained 12B an
+        # opening it had only seen with thinking off.
+        text_parts.append(self.formatter.assistant_prefix(enable_thinking=enable_thinking))
         text_input = "\n".join(text_parts)
 
         # Note: NO truncation — Gemma4Processor truncates input_features
         # incorrectly when truncation=True (clips to ~6 frames even when
         # input_ids is well below max_length). Audio prompts are short.
+        text_input = self._with_bos(text_input)
         inputs = self.processor(
             text=[text_input],
             audio=audios,
@@ -1976,7 +2002,7 @@ class GAIAEngine:
         inputs = {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
         return inputs
 
-    def _prepare_vision_inputs(self, messages: list) -> dict:
+    def _prepare_vision_inputs(self, messages: list, enable_thinking: bool = True) -> dict:
         """Process multimodal messages through the VL processor.
 
         Handles OpenAI-format vision messages where content is a list:
@@ -2061,11 +2087,14 @@ class GAIAEngine:
             raise ValueError("_prepare_vision_inputs called but no images found in messages")
 
         # Append the assistant generation prompt so the model knows where to
-        # start emitting its reply. enable_thinking=True matches the default
-        # text path.
-        text_parts.append(self.formatter.assistant_prefix(enable_thinking=True))
+        # start emitting its reply.
+        # The request's thinking setting, as on the text path (2026-11-07): always
+        # True gave a stock Gemma 4 a thought channel, and a house-trained 12B an
+        # opening it had only seen with thinking off.
+        text_parts.append(self.formatter.assistant_prefix(enable_thinking=enable_thinking))
         text_input = "\n".join(text_parts)
 
+        text_input = self._with_bos(text_input)
         inputs = self.processor(
             text=[text_input],
             images=images,
@@ -2136,7 +2165,7 @@ class GAIAEngine:
             # audio path also handles the text-only fields the same way.)
             if self._has_audio_content(messages):
                 logger.info("Audio content detected — using multimodal processor path")
-                audio_inputs = self._prepare_audio_inputs(messages)
+                audio_inputs = self._prepare_audio_inputs(messages, enable_thinking=enable_thinking)
                 input_ids = audio_inputs.pop("input_ids")
                 total_input = input_ids.shape[1]
                 past_kv = None
@@ -2182,7 +2211,7 @@ class GAIAEngine:
             # ── VISION MODE: multimodal input via processor ────────────
             if self._has_vision_content(messages):
                 logger.info("Vision content detected — using multimodal processor path")
-                vision_inputs = self._prepare_vision_inputs(messages)
+                vision_inputs = self._prepare_vision_inputs(messages, enable_thinking=enable_thinking)
                 input_ids = vision_inputs.pop("input_ids")
                 total_input = input_ids.shape[1]
                 past_kv = None

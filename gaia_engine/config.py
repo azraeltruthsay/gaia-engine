@@ -11,6 +11,11 @@ import os
 
 GGUF_CTX_SIZE: int = int(os.environ.get("GGUF_CTX_SIZE", os.environ.get("CORE_CPU_CTX", "16384")))
 GGUF_THREADS: int = int(os.environ.get("GGUF_THREADS", "16"))
+# Threads for reading the prompt (-1 = same as GGUF_THREADS). Generation is
+# memory-bandwidth bound and peaks near the physical core count; prompt reading
+# is compute bound and keeps scaling (ojwf, 12B Q8 on a 16-core 9950X3D:
+# generation best at 12, prefill 57 tok/s at 16 threads vs 78 at 24).
+GGUF_THREADS_BATCH: int = int(os.environ.get("GGUF_THREADS_BATCH", "-1"))
 
 # GPU offload layer count for GGUF models when device="cuda". 999 = "all layers"
 # (llama.cpp clamps to the real count). NOTE: Gemma 4 GGUF crashes in the CUDA

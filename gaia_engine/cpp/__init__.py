@@ -15,7 +15,9 @@ import os as _os
 
 _LIB_DIR = _os.path.join(_os.path.dirname(__file__), "lib")
 # Dependency order: each library's own dependencies first.
-_BUNDLED = ("libggml-base.so.0", "libggml-cpu.so.0", "libggml-cuda.so.0", "libggml.so.0", "libllama.so.0")
+# libllama-common: speculative (MTP) driver, needed since the b11804 bump (ojwf).
+_BUNDLED = ("libggml-base.so.0", "libggml-cpu.so.0", "libggml-cuda.so.0", "libggml.so.0", "libllama.so.0",
+            "libllama-common.so.0")
 
 
 def _load_bundled_libs():

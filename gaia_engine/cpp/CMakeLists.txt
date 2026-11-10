@@ -18,6 +18,10 @@ set(LLAMA_BIN_DIR   "${LLAMA_BUILD_DIR}/bin"      CACHE PATH "llama.cpp build ou
 
 set(LLAMA_INCLUDE_DIR "${LLAMA_SRC_DIR}/include"        CACHE PATH "llama.h location")
 set(GGML_INCLUDE_DIR  "${LLAMA_SRC_DIR}/ggml/include"   CACHE PATH "ggml.h location")
+# common/ (speculative driver, batch helpers) and src/llama-ext.h (staging API
+# the MTP driver uses): needed since the b11804 bump for MTP (GAIA_Project-ojwf).
+set(LLAMA_COMMON_DIR  "${LLAMA_SRC_DIR}/common"         CACHE PATH "common.h / speculative.h location")
+set(LLAMA_PRIV_DIR    "${LLAMA_SRC_DIR}/src"            CACHE PATH "llama-ext.h location")
 
 # ── gaia_cpp extension ────────────────────────────────────────────────────────
 pybind11_add_module(gaia_cpp
@@ -27,11 +31,14 @@ pybind11_add_module(gaia_cpp
 target_include_directories(gaia_cpp PRIVATE
     ${LLAMA_INCLUDE_DIR}
     ${GGML_INCLUDE_DIR}
+    ${LLAMA_COMMON_DIR}
+    ${LLAMA_PRIV_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}   # for hidden_state_capture.hpp
 )
 
 target_link_libraries(gaia_cpp PRIVATE
     ${LLAMA_BIN_DIR}/libllama.so
+    ${LLAMA_BIN_DIR}/libllama-common.so
     ${LLAMA_BIN_DIR}/libggml.so
 )
 

@@ -132,6 +132,7 @@ class GaiaCppBackendAdapter:
         capture_layers: Optional[List[int]] = None,
         tier: str = "prime",
         prompt_format: str = "house",
+        n_threads_batch: int = -1,
     ):
         from gaia_engine.prompt_format import normalize
         self.prompt_format = normalize(prompt_format)
@@ -142,18 +143,19 @@ class GaiaCppBackendAdapter:
         self.tier = tier
 
         logger.info(
-            "Loading GGUF via gaia_cpp: %s (gpu_layers=%d, ctx=%d, threads=%d)",
+            "Loading GGUF via gaia_cpp: %s (gpu_layers=%d, ctx=%d, threads=%d, batch threads=%s)",
             model_path, n_gpu_layers, n_ctx, n_threads,
+            n_threads_batch if n_threads_batch > 0 else "same",
         )
 
-        # Create C++ backend with empty capture layers initially
-        self._backend = LlamaCppBackend(
-            model_path,
-            n_gpu_layers,
-            [],          # resolved below after knowing n_layer
-            n_ctx,
-            n_threads,
-        )
+        # Create C++ backend with empty capture layers initially. ojwf: the
+        # prompt-read thread count is separate since the b11804 build; an
+        # older extension takes five arguments and reads with n_threads.
+        try:
+            self._backend = LlamaCppBackend(
+                model_path, n_gpu_layers, [], n_ctx, n_threads, n_threads_batch)
+        except TypeError:
+            self._backend = LlamaCppBackend(model_path, n_gpu_layers, [], n_ctx, n_threads)
 
         # Resolve capture layers based on actual model depth
         n_layers = self._backend.n_layer()
@@ -198,6 +200,25 @@ class GaiaCppBackendAdapter:
         else:
             logger.info("gaia_cpp: extension predates KV control (d12t); every request reads its full prompt")
 
+        # ojwf: MTP speculative decoding. GAIA_CPP_MTP_DRAFT names a draft
+        # "assistant" GGUF made for this model (Gemma 4 12B:
+        # google/gemma-4-12B-it-assistant); GAIA_CPP_MTP_N is the draft length.
+        # Output follows the same distribution as without it; only speed changes.
+        self._mtp_last: dict = {}
+        draft = os.environ.get("GAIA_CPP_MTP_DRAFT", "")
+        if draft:
+            if not hasattr(self._backend, "enable_mtp"):
+                logger.warning("gaia_cpp: GAIA_CPP_MTP_DRAFT set, but this extension predates MTP")
+            elif not os.path.exists(draft):
+                logger.warning("gaia_cpp: MTP draft %s not found; running without MTP", draft)
+            else:
+                err = self._backend.enable_mtp(draft, int(os.environ.get("GAIA_CPP_MTP_N", "3")))
+                if err:
+                    logger.warning("gaia_cpp: MTP not enabled (%s)", err)
+                else:
+                    logger.info("gaia_cpp: MTP on, draft %s, n_max %s", draft,
+                                self._backend.mtp_stats()["n_max"])
+
     # ── Health ────────────────────────────────────────────────────────────────
 
     def health(self) -> dict:
@@ -213,7 +234,24 @@ class GaiaCppBackendAdapter:
             "lora_active": self._backend.active_adapter_count(),
             "lora_path":   self._lora_path,
             "kv":          self.kv_stats(),
+            "mtp":         self.mtp_stats(),
         }
+
+    def mtp_stats(self) -> dict:
+        """MTP draft counters ({} on an extension without MTP). Like kv_stats,
+        never waits on a running request."""
+        if not hasattr(self._backend, "mtp_stats"):
+            return {}
+        if not self._request_lock.acquire(blocking=False):
+            return {**self._mtp_last, "busy": True}
+        try:
+            self._mtp_last = dict(self._backend.mtp_stats())
+            return self._mtp_last
+        except Exception as e:  # never fail /health over stats
+            logger.debug("mtp_stats failed: %s", e)
+            return {"error": str(e)}
+        finally:
+            self._request_lock.release()
 
     # ── KV cache control (d12t) ───────────────────────────────────────────────
 
@@ -272,10 +310,12 @@ class GaiaCppBackendAdapter:
 
     def _log_reuse(self, result) -> None:
         if self._kv_control and result.prompt_tokens:
-            logger.debug("gaia_cpp: prompt %d tok — %d reused%s, %d evaluated",
+            logger.debug("gaia_cpp: prompt %d tok — %d reused%s, %d evaluated%s",
                          result.prompt_tokens, result.reused_tokens,
                          " (snapshot)" if result.snapshot_restored else "",
-                         result.evaluated_tokens)
+                         result.evaluated_tokens,
+                         f"; MTP {result.draft_accepted}/{result.draft_tokens} drafted accepted"
+                         if getattr(result, "draft_tokens", 0) else "")
 
     # ── Streaming generation ──────────────────────────────────────────────────
 

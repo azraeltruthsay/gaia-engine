@@ -33,6 +33,15 @@
 //     (e.g. a system prompt) survives a restart.
 // The cache is dropped whenever it could be stale: LoRA changes, decode
 // errors, and requests that capture every prompt token's hidden state.
+//
+// MTP speculative decoding (GAIA_Project-ojwf): enable_mtp() loads a draft
+// "assistant" (e.g. google/gemma-4-12B-it-assistant, 4 layers) that reads the
+// target's hidden states and proposes the next few tokens; the target checks
+// them all in one batch. Every token still comes from the target's own
+// sampler, accepted only while it matches the draft, so the output follows the
+// same distribution as without MTP (greedy: byte-identical on CPU). Gemma 4's
+// assistant shares the target's KV cache, so prefix reuse and snapshots stay
+// valid. Driven by llama.cpp's common speculative driver (b11804+).
 
 #include <pybind11/pybind11.h>
 #include <pybind11/functional.h>
@@ -52,6 +61,9 @@
 #include <vector>
 
 #include "llama.h"
+#include "llama-ext.h"   // llama_set_embeddings_nextn (staging API, used to switch MTP off)
+#include "common.h"
+#include "speculative.h"
 #include "hidden_state_capture.hpp"
 
 namespace py = pybind11;
@@ -69,6 +81,9 @@ struct GenerateResult {
     int reused_tokens = 0;
     int evaluated_tokens = 0;
     bool snapshot_restored = false;
+    // ojwf: MTP draft tokens proposed / accepted in this request (0 = MTP off).
+    int draft_tokens = 0;
+    int draft_accepted = 0;
     // {layer_idx → raw float vector}, converted to numpy after GIL re-acquisition
     std::unordered_map<int, std::vector<float>> hidden_states;
 };
@@ -82,15 +97,21 @@ public:
     //   n_gpu_layers  — layers to offload to GPU (0=CPU, -1=all)
     //   capture_layers— layer indices for hidden state extraction (empty=none)
     //   n_ctx         — context window size
-    //   n_threads     — CPU threads for inference (-1 = auto = hw_concurrency/2)
+    //   n_threads     — CPU threads for generation (-1 = auto = hw_concurrency/2)
+    //   n_threads_batch — CPU threads for reading the prompt (-1 = n_threads).
+    //                   Generation is memory-bandwidth bound and peaks around
+    //                   the physical core count; prompt reading is compute
+    //                   bound and keeps scaling (ojwf: 12B Q8 on a 16-core
+    //                   9950X3D, prefill 57 tok/s at 16 threads, 78 at 24).
     LlamaCppBackend(
         const std::string& model_path,
         int n_gpu_layers,
         std::vector<int> capture_layers,
         int n_ctx,
-        int n_threads
+        int n_threads,
+        int n_threads_batch
     )
-        : model_path_(model_path)
+        : model_path_(model_path), n_gpu_layers_(n_gpu_layers)
     {
         llama_backend_init();
 
@@ -112,7 +133,7 @@ public:
         cparams.n_threads = (n_threads > 0)
             ? n_threads
             : static_cast<int>(std::thread::hardware_concurrency() / 2);
-        cparams.n_threads_batch = cparams.n_threads;
+        cparams.n_threads_batch = (n_threads_batch > 0) ? n_threads_batch : cparams.n_threads;
 
         // Register the hidden state eval callback
         capture_state_.capture_layers = std::move(capture_layers);
@@ -127,6 +148,7 @@ public:
     }
 
     ~LlamaCppBackend() {
+        _free_mtp();
         lora_adapters_.clear();  // adapter memory managed by llama_model_free in b8250+
         if (ctx_)   { llama_free(ctx_); ctx_ = nullptr; }
         if (model_) { llama_model_free(model_); model_ = nullptr; }
@@ -221,6 +243,77 @@ public:
         lora_adapters_.clear();
         lora_scales_.clear();
         // Adapters freed automatically with model (b8250+)
+    }
+
+    // ── MTP speculative decoding (ojwf) ─────────────────────────────────────
+
+    // Load an MTP draft model and turn speculative decoding on. n_max is how
+    // many tokens to draft per step (3 was best for the 12B on CPU: 1.7x).
+    // Returns "" on success, else why it could not be enabled (the backend
+    // then runs exactly as before).
+    std::string enable_mtp(const std::string& draft_path, int n_max) {
+        std::lock_guard<std::mutex> lock(inference_mtx_);
+        _free_mtp();
+
+        llama_model_params mparams = llama_model_default_params();
+        mparams.n_gpu_layers = n_gpu_layers_;
+        mtp_model_ = llama_model_load_from_file(draft_path.c_str(), mparams);
+        if (!mtp_model_) return "could not load draft model " + draft_path;
+
+        if (llama_model_n_embd_out(mtp_model_) != llama_model_n_embd_out(model_)) {
+            _free_mtp();
+            return "draft model does not match the target (hidden width differs)";
+        }
+
+        llama_context_params cparams = llama_context_default_params();
+        cparams.n_ctx = llama_n_ctx(ctx_);
+        cparams.n_batch = llama_n_batch(ctx_);
+        cparams.n_threads = llama_n_threads(ctx_);
+        cparams.n_threads_batch = llama_n_threads_batch(ctx_);
+        cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        cparams.ctx_other = ctx_;
+        cparams.n_rs_seq = 0;
+        mtp_ctx_ = llama_init_from_model(mtp_model_, cparams);
+        if (!mtp_ctx_) { _free_mtp(); return "could not create the MTP draft context"; }
+
+        // The verify loop trims rejected draft tokens from the KV, which needs
+        // partial sequence removal. (This probe clears the KV.)
+        if (common_context_can_seq_rm(ctx_) != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+            _free_mtp();
+            _invalidate_kv();
+            return "target context cannot remove partial sequences; MTP needs it";
+        }
+
+        common_params_speculative sp;
+        sp.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        sp.draft.n_max = std::max(1, n_max);
+        sp.draft.ctx_tgt = ctx_;
+        sp.draft.ctx_dft = mtp_ctx_;
+        spec_ = common_speculative_init(sp, 1);
+        if (!spec_) { _free_mtp(); _invalidate_kv(); return "speculative driver failed to start"; }
+
+        mtp_n_max_ = sp.draft.n_max;
+        mtp_path_ = draft_path;
+        _invalidate_kv();
+        return "";
+    }
+
+    void disable_mtp() {
+        std::lock_guard<std::mutex> lock(inference_mtx_);
+        _free_mtp();
+        _invalidate_kv();
+    }
+
+    py::dict mtp_stats() {
+        std::lock_guard<std::mutex> lock(inference_mtx_);
+        py::dict d;
+        d["enabled"] = spec_ != nullptr;
+        d["draft_model"] = mtp_path_;
+        d["n_max"] = mtp_n_max_;
+        d["drafted_total"] = stat_drafted_;
+        d["accepted_total"] = stat_accepted_;
+        d["acceptance"] = stat_drafted_ ? static_cast<double>(stat_accepted_) / stat_drafted_ : 0.0;
+        return d;
     }
 
     // ── KV cache control (d12t) ─────────────────────────────────────────────
@@ -343,9 +436,39 @@ public:
 
 private:
     std::string model_path_;
+    int n_gpu_layers_ = 0;
     llama_model* model_ = nullptr;
     llama_context* ctx_ = nullptr;
     const llama_vocab* vocab_ = nullptr;
+
+    // ── MTP state (ojwf) ──────────────────────────────────────────────────
+    llama_model* mtp_model_ = nullptr;
+    llama_context* mtp_ctx_ = nullptr;
+    common_speculative* spec_ = nullptr;
+    std::string mtp_path_;
+    int mtp_n_max_ = 0;
+    long long stat_drafted_ = 0, stat_accepted_ = 0;
+
+    void _free_mtp() {
+        if (spec_) { common_speculative_free(spec_); spec_ = nullptr; }
+        if (mtp_ctx_) { llama_free(mtp_ctx_); mtp_ctx_ = nullptr; }
+        if (mtp_model_) { llama_model_free(mtp_model_); mtp_model_ = nullptr; }
+        // The driver switched the target to emitting next-n embeddings; a
+        // plain decode doesn't need them.
+        if (ctx_) llama_set_embeddings_nextn(ctx_, false, false);
+        mtp_path_.clear();
+        mtp_n_max_ = 0;
+    }
+
+    // Copy what the hidden-state callback captured (caller decides when the
+    // capture belongs to a real token of the reply).
+    std::unordered_map<int, std::vector<float>> _copy_captures() {
+        std::unordered_map<int, std::vector<float>> out;
+        std::lock_guard<std::mutex> lk(capture_state_.mtx);
+        for (auto& [layer_idx, cap] : capture_state_.captures)
+            if (!cap.data.empty()) out[layer_idx] = cap.data;
+        return out;
+    }
 
     HiddenStateCaptureState capture_state_;
     std::mutex inference_mtx_;
@@ -418,8 +541,9 @@ private:
 
     // Prepare seq 0's KV for `prompt`: keep (or restore) the longest usable
     // prefix and drop the rest. Returns how many prompt tokens are already
-    // in the KV; the caller evaluates the remainder.
-    size_t _prepare_kv(const std::vector<llama_token>& prompt, bool& restored) {
+    // in the KV; the caller evaluates the remainder. At least `n_tail` final
+    // prompt tokens are always left to evaluate.
+    size_t _prepare_kv(const std::vector<llama_token>& prompt, bool& restored, size_t n_tail = 1) {
         restored = false;
         llama_memory_t mem = llama_get_memory(ctx_);
         size_t reuse = _common_prefix(kv_tokens_, prompt);
@@ -445,8 +569,10 @@ private:
         }
 
         // The last prompt token is always evaluated: its logits pick the
-        // first reply token, and logits aren't part of the cache.
-        if (reuse >= prompt.size()) reuse = prompt.size() - 1;
+        // first reply token, and logits aren't part of the cache. (MTP keeps
+        // one more: its drafter needs the target's hidden state for the token
+        // before the last, which isn't cached either.)
+        if (reuse + n_tail > prompt.size()) reuse = prompt.size() - n_tail;
         if (reuse < kv_tokens_.size() && !llama_memory_seq_rm(mem, 0, static_cast<llama_pos>(reuse), -1)) {
             llama_memory_clear(mem, true);  // partial removal unsupported: start over
             reuse = 0;
@@ -513,6 +639,13 @@ private:
 
         if (prompt_tokens.empty()) {
             return result;
+        }
+
+        // ojwf: speculative path. Not for full-prompt residual capture (SAE
+        // atlas), which needs every prompt token's states from a fresh read.
+        if (spec_ && prompt_tokens.size() >= 2
+                && !(capture_hidden && capture_state_.all_tokens.load(std::memory_order_acquire))) {
+            return _generate_mtp(prompt_tokens, token_cb, max_tokens, temperature, top_p, top_k, capture_hidden);
         }
 
         // ── Prompt eval ────────────────────────────────────────────────────
@@ -630,6 +763,160 @@ private:
         result.completion_tokens = n_generated;
         return result;
     }
+
+    // ── MTP generation loop (ojwf) ────────────────────────────────────────
+    // Follows llama.cpp's examples/speculative-simple, minus checkpoints
+    // (enable_mtp requires partial KV removal). The prompt is read up to its
+    // last token; each step then evaluates [last token, draft...] in one
+    // batch, keeps the target's sampled tokens while they match the draft,
+    // and trims the rejected tail from the KV.
+    GenerateResult _generate_mtp(
+        const std::vector<llama_token>& prompt_tokens,
+        std::function<void(const std::string&)> token_cb,
+        int max_tokens,
+        float temperature,
+        float top_p,
+        int top_k,
+        bool capture_hidden
+    ) {
+        GenerateResult result;
+        result.prompt_tokens = static_cast<int>(prompt_tokens.size());
+        llama_memory_t mem = llama_get_memory(ctx_);
+        const llama_seq_id seq = 0;
+
+        // ── Prompt eval: everything but the last token ─────────────────────
+        size_t reuse = 0;
+        bool restored = false;
+        if (prefix_reuse_) {
+            reuse = _prepare_kv(prompt_tokens, restored, /*n_tail=*/2);
+        } else {
+            llama_memory_clear(mem, true);
+            kv_tokens_.clear();
+        }
+        const size_t n_head = prompt_tokens.size() - 1;  // tokens put in the KV now
+
+        if (capture_hidden) {
+            capture_state_.reset_captures();
+            capture_state_.active.store(true, std::memory_order_release);
+        }
+        common_batch batch_prompt(ctx_);
+        for (size_t i = reuse; i < n_head; ++i)
+            batch_prompt.add(prompt_tokens[i], static_cast<llama_pos>(i), seq, false);
+        int ret = llama_process(ctx_, LLAMA_PROCESS_TYPE_DECODE, batch_prompt.get());
+        if (capture_hidden) capture_state_.active.store(false, std::memory_order_release);
+        if (ret != 0) {
+            _invalidate_kv();
+            throw std::runtime_error("llama_process failed on prompt (ret=" + std::to_string(ret) + ")");
+        }
+        if (!common_speculative_process(spec_, batch_prompt)) {
+            _invalidate_kv();
+            throw std::runtime_error("MTP: speculative driver rejected the prompt batch");
+        }
+        // Hidden states fallback: the state at the end of the prompt read.
+        if (capture_hidden) result.hidden_states = _copy_captures();
+
+        llama_tokens prompt_tgt(prompt_tokens.begin(), prompt_tokens.begin() + n_head);
+        kv_tokens_ = prompt_tgt;
+        result.reused_tokens = static_cast<int>(reuse);
+        result.evaluated_tokens = static_cast<int>(n_head - reuse) + 1;  // + the last token, read in step 1
+        result.snapshot_restored = restored;
+        ++stat_requests_;
+        stat_reused_ += static_cast<long long>(reuse);
+        stat_evaluated_ += result.evaluated_tokens;
+        stat_restores_ += restored;
+        if (prefix_reuse_ && static_cast<size_t>(result.evaluated_tokens) >= kMinSnapshotTokens) {
+            _take_snapshot(/*pinned=*/false);
+        }
+
+        common_speculative_begin(spec_, seq, prompt_tgt);
+
+        // ── Draft / verify loop ────────────────────────────────────────────
+        llama_sampler* sampler = _build_sampler(temperature, top_p, top_k);
+        llama_token id_last = prompt_tokens.back();
+        int n_past = static_cast<int>(n_head);
+        const int n_ctx = static_cast<int>(llama_n_ctx(ctx_));
+        common_batch batch_tgt(ctx_);
+        llama_tokens draft;
+        std::string full_text;
+        int n_generated = 0;
+        bool done = false;
+
+        while (!done && n_generated < max_tokens) {
+            int n_draft_max = std::min(n_ctx - n_past - 2, max_tokens - n_generated - 1);
+            draft.clear();
+            if (n_draft_max > 0) {
+                common_speculative_get_draft_params(spec_, seq) = {
+                    /* .drafting = */ true,
+                    /* .n_max    = */ n_draft_max,
+                    /* .pos0     = */ n_past,
+                    /* .id_last  = */ id_last,
+                    /* .prompt   = */ &prompt_tgt,
+                    /* .result   = */ &draft,
+                };
+                common_speculative_draft(spec_);
+            }
+
+            batch_tgt.clear();
+            batch_tgt.add(id_last, n_past, seq, true);
+            for (size_t i = 0; i < draft.size(); ++i)
+                batch_tgt.add(draft[i], n_past + 1 + static_cast<int>(i), seq, true);
+
+            if (capture_hidden) {
+                capture_state_.reset_captures();
+                capture_state_.active.store(true, std::memory_order_release);
+            }
+            ret = llama_process(ctx_, LLAMA_PROCESS_TYPE_DECODE, batch_tgt.get());
+            if (capture_hidden) capture_state_.active.store(false, std::memory_order_release);
+            if (ret != 0 || !common_speculative_process(spec_, batch_tgt)) {
+                _invalidate_kv();  // context full or error: stop, don't trust the cache
+                break;
+            }
+            ++n_past;  // id_last is now in the KV
+
+            // The target samples each position itself; a draft token counts
+            // only if the target picked the same one.
+            std::vector<llama_token> ids;
+            for (size_t i = 0; i <= draft.size(); ++i) {
+                llama_token tok = llama_sampler_sample(sampler, ctx_, static_cast<int32_t>(i));
+                ids.push_back(tok);
+                if (i < draft.size() && tok != draft[i]) break;
+            }
+            const size_t n_acc = ids.size() - 1;
+            common_speculative_accept(spec_, seq, static_cast<uint16_t>(n_acc));
+            result.draft_tokens += static_cast<int>(draft.size());
+            result.draft_accepted += static_cast<int>(n_acc);
+            // Every batch row was a real token: keep its last-token states.
+            if (capture_hidden && n_acc == draft.size()) result.hidden_states = _copy_captures();
+
+            prompt_tgt.push_back(id_last);  // in the KV
+            for (size_t i = 0; i < ids.size(); ++i) {
+                id_last = ids[i];
+                if (llama_vocab_is_eog(vocab_, id_last)) { done = true; break; }
+                std::string piece = _token_to_piece(id_last);
+                full_text += piece;
+                ++n_generated;
+                if (token_cb && !piece.empty()) token_cb(piece);
+                if (n_generated >= max_tokens) { done = true; break; }
+                if (i + 1 < ids.size()) prompt_tgt.push_back(id_last);  // accepted draft: in the KV
+            }
+            // Drop rejected draft tokens (and anything past the stop point).
+            n_past = static_cast<int>(prompt_tgt.size());
+            llama_memory_seq_rm(mem, seq, n_past, -1);
+            kv_tokens_ = prompt_tgt;
+        }
+
+        llama_sampler_free(sampler);
+        stat_drafted_ += result.draft_tokens;
+        stat_accepted_ += result.draft_accepted;
+
+        if (!prefix_reuse_) {
+            llama_memory_clear(mem, true);
+            kv_tokens_.clear();
+        }
+        result.text = std::move(full_text);
+        result.completion_tokens = n_generated;
+        return result;
+    }
 };
 
 // ── pybind11 module ───────────────────────────────────────────────────────────
@@ -660,18 +947,21 @@ PYBIND11_MODULE(gaia_cpp, m) {
         .def_readonly("reused_tokens",     &GenerateResult::reused_tokens)
         .def_readonly("evaluated_tokens",  &GenerateResult::evaluated_tokens)
         .def_readonly("snapshot_restored", &GenerateResult::snapshot_restored)
+        .def_readonly("draft_tokens",      &GenerateResult::draft_tokens)
+        .def_readonly("draft_accepted",    &GenerateResult::draft_accepted)
         .def_property_readonly("hidden_states", [](const GenerateResult& r) {
             // Convert raw float vectors → numpy arrays (GIL is held here)
             return _hidden_states_to_numpy(r.hidden_states);
         });
 
     py::class_<LlamaCppBackend>(m, "LlamaCppBackend")
-        .def(py::init<const std::string&, int, std::vector<int>, int, int>(),
+        .def(py::init<const std::string&, int, std::vector<int>, int, int, int>(),
             py::arg("model_path"),
             py::arg("n_gpu_layers")   = 0,
             py::arg("capture_layers") = std::vector<int>{},
             py::arg("n_ctx")          = 4096,
-            py::arg("n_threads")      = -1)
+            py::arg("n_threads")      = -1,
+            py::arg("n_threads_batch") = -1)
 
         .def("generate",
             [](LlamaCppBackend& self,
@@ -747,6 +1037,13 @@ PYBIND11_MODULE(gaia_cpp, m) {
         .def("load_state",         &LlamaCppBackend::load_state, py::arg("path"),
              py::call_guard<py::gil_scoped_release>())
         .def("kv_stats",           &LlamaCppBackend::kv_stats)
+        // ojwf: MTP speculative decoding
+        .def("enable_mtp",         &LlamaCppBackend::enable_mtp,
+             py::arg("draft_path"), py::arg("n_max") = 3,
+             py::call_guard<py::gil_scoped_release>())
+        .def("disable_mtp",        &LlamaCppBackend::disable_mtp,
+             py::call_guard<py::gil_scoped_release>())
+        .def("mtp_stats",          &LlamaCppBackend::mtp_stats)
 
         .def("n_vocab",         &LlamaCppBackend::n_vocab)
         .def("n_embd",          &LlamaCppBackend::n_embd)

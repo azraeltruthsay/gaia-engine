@@ -873,6 +873,10 @@ class EngineManager:
                 "backend": backend or "cpp",
                 "device": device or "cpu",
                 "model_path": model_path or "",
+                # The lifecycle machine reads "model": without it the nano
+                # alias (a proxy to this engine) couldn't be de-duplicated and
+                # counted as a second GPU holder once vram_mb was real.
+                "model": model_path or "",
                 "vram_mb": _cpp_vram_mb(cpp),
             }
 

@@ -132,6 +132,16 @@ def _wait_for_health(port: int, timeout: int = 180) -> bool:
     return False
 
 
+def _cpp_vram_mb(cpp) -> int:
+    """GPU memory the gaia_cpp backend allocated, measured at load (frlp).
+    The gearbox budgets gears from this; 0 (the old answer) made it count
+    Core's GGUF as an outside tenant and refuse the listening gear."""
+    try:
+        return int(cpp._backend.vram_mb())
+    except Exception:
+        return 0
+
+
 def _repetition_penalty(req: dict) -> float:
     """The repetition penalty a request gets, worked out as the torch worker
     does (core.py /v1/chat/completions): an explicit repetition_penalty, else
@@ -863,6 +873,7 @@ class EngineManager:
                 "backend": backend or "cpp",
                 "device": device or "cpu",
                 "model_path": model_path or "",
+                "vram_mb": _cpp_vram_mb(cpp),
             }
 
         if worker_alive and worker_port:
@@ -915,7 +926,7 @@ class EngineManager:
                 "model_path": model_path or "",
                 "device": device or "cpu",
                 "backend": backend or "cpp",
-                "vram_mb": 0,
+                "vram_mb": _cpp_vram_mb(cpp),
             }
 
         if worker_alive and worker_port:
@@ -1000,7 +1011,7 @@ class EngineManager:
                 "model_loaded": True,
                 "backend": "cpp",
                 "device": "cuda" if h.get("has_gpu") else "cpu",
-                "vram_mb": 0,  # cpp backend doesn't track VRAM per-model
+                "vram_mb": h.get("vram_mb", 0),  # measured by gaia_cpp at load (frlp)
                 "model": h.get("model", ""),
             }).encode())
 

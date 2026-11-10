@@ -61,6 +61,7 @@
 #include <vector>
 
 #include "llama.h"
+#include "ggml-backend.h"
 #include "llama-ext.h"   // llama_set_embeddings_nextn (staging API, used to switch MTP off)
 #include "common.h"
 #include "speculative.h"
@@ -69,6 +70,26 @@
 #include "hidden_state_capture.hpp"
 
 namespace py = pybind11;
+
+// Free memory on the first GPU device (bytes), 0 if there is none. The
+// backend's VRAM is measured as the drop in free memory across its own
+// allocations (frlp): the gearbox budgets gears from it, and reported 0 made
+// it count Core's whole GGUF as an outside tenant.
+static size_t gaia_gpu_free_bytes() {
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            return free;
+        }
+    }
+    return 0;
+}
+static long long gaia_gpu_delta(size_t before) {
+    size_t after = gaia_gpu_free_bytes();
+    return before > after ? static_cast<long long>(before - after) : 0;
+}
 
 // ── GenerateResult ────────────────────────────────────────────────────────────
 
@@ -117,6 +138,7 @@ public:
         : model_path_(model_path), n_gpu_layers_(n_gpu_layers)
     {
         llama_backend_init();
+        const size_t gpu_free0 = n_gpu_layers != 0 ? gaia_gpu_free_bytes() : 0;
 
         // ── Model params ────────────────────────────────────────────────────
         llama_model_params mparams = llama_model_default_params();
@@ -163,6 +185,7 @@ public:
             llama_model_free(model_);
             throw std::runtime_error("Failed to create llama context");
         }
+        if (n_gpu_layers != 0) vram_main_ = gaia_gpu_delta(gpu_free0);
     }
 
     ~LlamaCppBackend() {
@@ -277,6 +300,7 @@ public:
     std::string enable_mtp(const std::string& draft_path, int n_max) {
         std::lock_guard<std::mutex> lock(inference_mtx_);
         _free_mtp();
+        const size_t gpu_free0 = n_gpu_layers_ != 0 ? gaia_gpu_free_bytes() : 0;
 
         llama_model_params mparams = llama_model_default_params();
         mparams.n_gpu_layers = n_gpu_layers_;
@@ -322,6 +346,7 @@ public:
 
         mtp_n_max_ = sp.draft.n_max;
         mtp_path_ = draft_path;
+        if (n_gpu_layers_ != 0) vram_mtp_ = gaia_gpu_delta(gpu_free0);
         _invalidate_kv();
         return "";
     }
@@ -356,7 +381,8 @@ public:
 
     std::string load_mmproj(const std::string& path, int image_tokens) {
         std::lock_guard<std::mutex> lock(inference_mtx_);
-        if (mtmd_) { mtmd_free(mtmd_); mtmd_ = nullptr; }
+        if (mtmd_) { mtmd_free(mtmd_); mtmd_ = nullptr; vram_mmproj_ = 0; }
+        const size_t gpu_free0 = n_gpu_layers_ != 0 ? gaia_gpu_free_bytes() : 0;
         mtmd_context_params p = mtmd_context_params_default();
         p.use_gpu = n_gpu_layers_ != 0;
         p.print_timings = false;
@@ -366,6 +392,7 @@ public:
         mtmd_ = mtmd_init_from_file(path.c_str(), model_, p);
         if (!mtmd_) return "could not load projector " + path;
         mmproj_path_ = path;
+        if (n_gpu_layers_ != 0) vram_mmproj_ = gaia_gpu_delta(gpu_free0);
         return "";
     }
 
@@ -570,6 +597,9 @@ public:
     bool has_gpu()      const { return n_gpu_layers_ != 0; }  // layers offloaded (frlp; was a TODO returning false)
     std::string model_path() const { return model_path_; }
     std::string kv_type() const { return kv_type_; }
+    // MB of GPU memory this backend allocated (model + context, MTP draft,
+    // projector), measured at load; 0 on the CPU.
+    long long vram_mb() const { return (vram_main_ + vram_mtp_ + vram_mmproj_) / (1024 * 1024); }
 
     // GGUF general.architecture ("gemma4", "qwen3vl", ...): the prompt format
     // follows the model, not its file name (a symlink like core.gguf says
@@ -602,6 +632,7 @@ public:
 private:
     std::string model_path_;
     std::string kv_type_ = "f16";
+    long long vram_main_ = 0, vram_mtp_ = 0, vram_mmproj_ = 0;  // bytes
     int n_gpu_layers_ = 0;
     llama_model* model_ = nullptr;
     llama_context* ctx_ = nullptr;
@@ -629,6 +660,7 @@ private:
         if (ctx_) llama_set_embeddings_nextn(ctx_, false, false);
         mtp_path_.clear();
         mtp_n_max_ = 0;
+        vram_mtp_ = 0;
     }
 
     // Copy what the hidden-state callback captured (caller decides when the
@@ -1273,6 +1305,7 @@ PYBIND11_MODULE(gaia_cpp, m) {
         .def("has_gpu",         &LlamaCppBackend::has_gpu)
         .def("model_path",      &LlamaCppBackend::model_path)
         .def("kv_type",         &LlamaCppBackend::kv_type)
+        .def("vram_mb",         &LlamaCppBackend::vram_mb)
         .def("architecture",    &LlamaCppBackend::architecture)
         .def("capture_layers",  &LlamaCppBackend::capture_layers)
         .def("set_capture_layers", &LlamaCppBackend::set_capture_layers)

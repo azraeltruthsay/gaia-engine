@@ -294,6 +294,7 @@ class GaiaCppBackendAdapter:
             "lora_path":   self._lora_path,
             "kv":          self.kv_stats(),
             "kv_type":     (self._backend.kv_type() if hasattr(self._backend, "kv_type") else "f16"),
+            "vram_mb":     (int(self._backend.vram_mb()) if hasattr(self._backend, "vram_mb") else 0),
             "mtp":         self.mtp_stats(),
             "media":       (self._backend.media_info() if hasattr(self._backend, "media_info") else {}),
         }

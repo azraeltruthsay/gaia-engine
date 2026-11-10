@@ -111,3 +111,44 @@ def test_older_extension_called_without_penalty():
 
     assert backend.GaiaCppBackendAdapter._call(old_generate, 1.1, "p", 10, 0.7, 0.9, 0, False) == "ok"
     assert len(seen) == 1
+
+
+def test_raw_completion_uses_prompt_as_given():
+    """ifzh: /v1/completions on gaia_cpp — the Neural Handoff replays a captured
+    prompt with max_tokens=1 to warm the KV cache."""
+    seen = {}
+
+    class Ext:
+        def generate(self, *args):
+            seen["args"] = args
+            return types.SimpleNamespace(text="x", prompt_tokens=900, completion_tokens=1,
+                                         reused_tokens=0, evaluated_tokens=900, snapshot_restored=False,
+                                         draft_tokens=0, draft_accepted=0, hidden_states={})
+
+    a = _adapter()
+    a._backend = Ext()
+    a._request_lock = threading.Lock()
+    a._kv_control = True
+    out = a.complete_json("<|turn>user<turn|>\nhello", max_tokens=1, temperature=0.0)
+    assert seen["args"][0] == "<|turn>user<turn|>\nhello" and seen["args"][1] == 1
+    assert out["object"] == "text_completion" and out["choices"][0]["text"] == "x"
+    assert out["usage"]["prompt_tokens"] == 900
+
+
+def test_raw_completion_streams_text_chunks():
+    class Ext:
+        def generate_stream(self, prompt, cb, *args):
+            for piece in ("Hel", "lo"):
+                cb(piece)
+            return types.SimpleNamespace(text="Hello", prompt_tokens=5, completion_tokens=2,
+                                         reused_tokens=0, evaluated_tokens=5, snapshot_restored=False,
+                                         draft_tokens=0, draft_accepted=0, hidden_states={})
+
+    a = _adapter()
+    a._backend = Ext()
+    a._request_lock = threading.Lock()
+    a._kv_control = False
+    out = []
+    a.complete_to_writer("p", 10, 0.7, 0.9, write_fn=out.append)
+    body = b"".join(out).decode()
+    assert '"text": "Hel"' in body and '"text": "lo"' in body and body.endswith("data: [DONE]\n\n")

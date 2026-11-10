@@ -1004,6 +1004,22 @@ class EngineManager:
                 "model": h.get("model", ""),
             }).encode())
 
+        if path == "/v1/completions" and method == "POST" and body:
+            # ifzh: raw prompt completions (Neural Handoff replay, VLLMRemote).
+            try:
+                req_data = json.loads(body)
+                result = cpp.complete_json(
+                    str(req_data.get("prompt", "")),
+                    int(req_data.get("max_tokens", 512)),
+                    float(req_data.get("temperature", 0.7)),
+                    float(req_data.get("top_p", 0.9)),
+                    repetition_penalty=_repetition_penalty(req_data),
+                )
+                return (200, ct, json.dumps(result).encode())
+            except Exception as e:
+                logger.error("cpp completion error: %s", e)
+                return (500, ct, json.dumps({"error": str(e)}).encode())
+
         if path == "/v1/chat/completions" and method == "POST" and body:
             try:
                 req_data = json.loads(body)
@@ -1294,7 +1310,7 @@ class ManagedEngineHandler(BaseHTTPRequestHandler):
         else:
             # Check if this is a streaming inference request
             is_stream = False
-            if self.path == "/v1/chat/completions" and raw_body:
+            if self.path in ("/v1/chat/completions", "/v1/completions") and raw_body:
                 try:
                     is_stream = json.loads(raw_body).get("stream", False)
                 except Exception:
@@ -1341,7 +1357,8 @@ class ManagedEngineHandler(BaseHTTPRequestHandler):
 
         try:
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=300)
-            conn.request("POST", "/v1/chat/completions", body=body,
+            # The route the client asked for (chat or raw completions).
+            conn.request("POST", self.path, body=body,
                          headers={"Content-Type": "application/json"})
             resp = conn.getresponse()
 
@@ -1410,11 +1427,17 @@ class ManagedEngineHandler(BaseHTTPRequestHandler):
                 self.wfile.write(data)
                 self.wfile.flush()
 
-            cpp.stream_to_writer(
-                messages, max_tokens, temperature, top_p, session_id,
-                write_fn=write_fn,
-                repetition_penalty=_repetition_penalty(req_data),
-            )
+            if self.path == "/v1/completions":  # ifzh: raw prompt, completion chunks
+                cpp.complete_to_writer(
+                    str(req_data.get("prompt", "")), max_tokens, temperature, top_p,
+                    write_fn=write_fn, repetition_penalty=_repetition_penalty(req_data),
+                )
+            else:
+                cpp.stream_to_writer(
+                    messages, max_tokens, temperature, top_p, session_id,
+                    write_fn=write_fn,
+                    repetition_penalty=_repetition_penalty(req_data),
+                )
 
         except Exception as e:
             logger.warning("cpp stream error: %s", e)

@@ -520,6 +520,52 @@ class GaiaCppBackendAdapter:
             },
         }
 
+    # ── Raw completions (ifzh) ───────────────────────────────────────────────
+    # /v1/completions: the prompt is used as given (no chat template). The
+    # orchestrator's Neural Handoff replays a captured prompt this way with
+    # max_tokens=1 to warm the cache: here the prompt lands in the KV prefix
+    # cache (and a snapshot when long), so the next turn sharing it skips
+    # the read. gaia-core's VLLMRemote create_completion uses it too.
+
+    def complete_json(self, prompt: str, max_tokens: int = 512, temperature: float = 0.7,
+                      top_p: float = 0.9, repetition_penalty: float = 1.0) -> dict:
+        with self._request_lock:
+            result = self._call(self._backend.generate, repetition_penalty,
+                                prompt, max_tokens, temperature, top_p, 0, False)
+        self._log_reuse(result)
+        return {
+            "id":      f"cmpl-{uuid.uuid4().hex[:8]}",
+            "object":  "text_completion",
+            "choices": [{"index": 0, "text": result.text, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens":     result.prompt_tokens,
+                "completion_tokens": result.completion_tokens,
+                **({"cached_prefix_tokens": result.reused_tokens} if self._kv_control else {}),
+            },
+        }
+
+    def complete_to_writer(self, prompt: str, max_tokens: int = 512, temperature: float = 0.7,
+                           top_p: float = 0.9, write_fn=None, repetition_penalty: float = 1.0) -> None:
+        gen_id = f"cmpl-{uuid.uuid4().hex[:8]}"
+
+        def token_callback(delta: str) -> None:
+            if write_fn is not None:
+                chunk = {"id": gen_id, "object": "text_completion",
+                         "choices": [{"index": 0, "text": delta, "finish_reason": None}]}
+                write_fn(f"data: {json.dumps(chunk)}\n\n".encode())
+
+        with self._request_lock:
+            result = self._call(self._backend.generate_stream, repetition_penalty,
+                                prompt, token_callback, max_tokens, temperature, top_p, 0, False)
+        self._log_reuse(result)
+        if write_fn is not None:
+            final = {"id": gen_id, "object": "text_completion",
+                     "choices": [{"index": 0, "text": "", "finish_reason": "stop"}],
+                     "usage": {"prompt_tokens": result.prompt_tokens,
+                               "completion_tokens": result.completion_tokens}}
+            write_fn(f"data: {json.dumps(final)}\n\n".encode())
+            write_fn(b"data: [DONE]\n\n")
+
     # ── Adapter management ────────────────────────────────────────────────────
 
     def load_adapter(self, adapter_path: str, scale: float = 1.0) -> bool:

@@ -22,6 +22,8 @@ set(GGML_INCLUDE_DIR  "${LLAMA_SRC_DIR}/ggml/include"   CACHE PATH "ggml.h locat
 # the MTP driver uses): needed since the b11804 bump for MTP (GAIA_Project-ojwf).
 set(LLAMA_COMMON_DIR  "${LLAMA_SRC_DIR}/common"         CACHE PATH "common.h / speculative.h location")
 set(LLAMA_PRIV_DIR    "${LLAMA_SRC_DIR}/src"            CACHE PATH "llama-ext.h location")
+# tools/mtmd: images and audio through the model's projector (GAIA_Project-frlp).
+set(LLAMA_MTMD_DIR    "${LLAMA_SRC_DIR}/tools/mtmd"     CACHE PATH "mtmd.h / mtmd-helper.h location")
 
 # ── gaia_cpp extension ────────────────────────────────────────────────────────
 pybind11_add_module(gaia_cpp
@@ -33,12 +35,14 @@ target_include_directories(gaia_cpp PRIVATE
     ${GGML_INCLUDE_DIR}
     ${LLAMA_COMMON_DIR}
     ${LLAMA_PRIV_DIR}
+    ${LLAMA_MTMD_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}   # for hidden_state_capture.hpp
 )
 
 target_link_libraries(gaia_cpp PRIVATE
     ${LLAMA_BIN_DIR}/libllama.so
     ${LLAMA_BIN_DIR}/libllama-common.so
+    ${LLAMA_BIN_DIR}/libmtmd.so
     ${LLAMA_BIN_DIR}/libggml.so
 )
 

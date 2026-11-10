@@ -64,6 +64,8 @@
 #include "llama-ext.h"   // llama_set_embeddings_nextn (staging API, used to switch MTP off)
 #include "common.h"
 #include "speculative.h"
+#include "mtmd.h"
+#include "mtmd-helper.h"
 #include "hidden_state_capture.hpp"
 
 namespace py = pybind11;
@@ -149,6 +151,7 @@ public:
 
     ~LlamaCppBackend() {
         _free_mtp();
+        if (mtmd_) { mtmd_free(mtmd_); mtmd_ = nullptr; }
         lora_adapters_.clear();  // adapter memory managed by llama_model_free in b8250+
         if (ctx_)   { llama_free(ctx_); ctx_ = nullptr; }
         if (model_) { llama_model_free(model_); model_ = nullptr; }
@@ -163,9 +166,11 @@ public:
         float temperature,
         float top_p,
         int top_k,
-        bool capture_hidden
+        bool capture_hidden,
+        float repeat_penalty = 1.0f
     ) {
         std::lock_guard<std::mutex> lock(inference_mtx_);
+        repeat_penalty_ = repeat_penalty;
         return _generate_impl(prompt, nullptr, max_tokens, temperature, top_p, top_k, capture_hidden);
     }
 
@@ -182,9 +187,11 @@ public:
         float temperature,
         float top_p,
         int top_k,
-        bool capture_hidden
+        bool capture_hidden,
+        float repeat_penalty = 1.0f
     ) {
         std::lock_guard<std::mutex> lock(inference_mtx_);
+        repeat_penalty_ = repeat_penalty;
         return _generate_impl(prompt, token_callback, max_tokens, temperature, top_p, top_k, capture_hidden);
     }
 
@@ -267,7 +274,12 @@ public:
 
         llama_context_params cparams = llama_context_default_params();
         cparams.n_ctx = llama_n_ctx(ctx_);
-        cparams.n_batch = llama_n_batch(ctx_);
+        // The drafter only ever decodes a few draft tokens at a time (Gemma 4's
+        // assistant shares the target KV and never reads the prompt itself), so
+        // a small batch keeps its compute buffer small: 512 cost ~520 MB VRAM
+        // on the GPU for nothing (frlp).
+        cparams.n_batch = 64;
+        cparams.n_ubatch = 64;
         cparams.n_threads = llama_n_threads(ctx_);
         cparams.n_threads_batch = llama_n_threads_batch(ctx_);
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
@@ -314,6 +326,142 @@ public:
         d["accepted_total"] = stat_accepted_;
         d["acceptance"] = stat_drafted_ ? static_cast<double>(stat_accepted_) / stat_drafted_ : 0.0;
         return d;
+    }
+
+    // ── Images and audio (frlp) ──────────────────────────────────────────────
+    //
+    // load_mmproj() attaches the model's multimodal projector (the mmproj GGUF
+    // exported from the same weights: convert_hf_to_gguf.py --mmproj). Media
+    // then go through generate_media(): the prompt carries media_marker() where
+    // each image or audio clip belongs, and media[i] holds that file's bytes
+    // (jpg/png/bmp/gif; wav/mp3/flac). image_tokens > 0 pins every image to that
+    // many tokens; Gemma 4 12B's HF processor uses 280 (max_soft_tokens), and
+    // llama.cpp's own default gave fewer and lost a vision test.
+
+    std::string load_mmproj(const std::string& path, int image_tokens) {
+        std::lock_guard<std::mutex> lock(inference_mtx_);
+        if (mtmd_) { mtmd_free(mtmd_); mtmd_ = nullptr; }
+        mtmd_context_params p = mtmd_context_params_default();
+        p.use_gpu = n_gpu_layers_ != 0;
+        p.print_timings = false;
+        p.n_threads = llama_n_threads_batch(ctx_);
+        p.warmup = false;
+        if (image_tokens > 0) { p.image_min_tokens = image_tokens; p.image_max_tokens = image_tokens; }
+        mtmd_ = mtmd_init_from_file(path.c_str(), model_, p);
+        if (!mtmd_) return "could not load projector " + path;
+        mmproj_path_ = path;
+        return "";
+    }
+
+    std::string media_marker() const { return mtmd_ ? std::string(mtmd_get_marker(mtmd_)) : std::string(); }
+
+    py::dict media_info() const {
+        py::dict d;
+        d["loaded"] = mtmd_ != nullptr;
+        d["mmproj"] = mmproj_path_;
+        d["vision"] = mtmd_ ? mtmd_support_vision(mtmd_) : false;
+        d["audio"] = mtmd_ ? mtmd_support_audio(mtmd_) : false;
+        return d;
+    }
+
+    GenerateResult generate_media(
+        const std::string& prompt,
+        const std::vector<std::string>& media,
+        std::function<void(const std::string&)> token_cb,
+        int max_tokens,
+        float temperature,
+        float top_p,
+        int top_k,
+        bool capture_hidden,
+        float repeat_penalty = 1.0f
+    ) {
+        std::lock_guard<std::mutex> lock(inference_mtx_);
+        repeat_penalty_ = repeat_penalty;
+        if (!mtmd_) throw std::runtime_error("no projector loaded (load_mmproj)");
+
+        std::vector<mtmd_bitmap*> bitmaps;
+        auto free_bitmaps = [&]() { for (auto* b : bitmaps) mtmd_bitmap_free(b); bitmaps.clear(); };
+        for (size_t i = 0; i < media.size(); ++i) {
+            mtmd_helper_bitmap_wrapper w = mtmd_helper_bitmap_init_from_buf(
+                mtmd_, reinterpret_cast<const unsigned char*>(media[i].data()), media[i].size(),
+                false, mtmd_helper_init_opt_default());
+            if (w.video_ctx) mtmd_helper_video_free(w.video_ctx);  // video isn't supported here
+            if (!w.bitmap) {
+                free_bitmaps();
+                throw std::runtime_error("media " + std::to_string(i) + ": not a supported image or audio file");
+            }
+            bitmaps.push_back(w.bitmap);
+        }
+
+        mtmd_input_chunks* chunks = mtmd_input_chunks_init();
+        mtmd_input_text text{prompt.c_str(), prompt.size(), /*add_special=*/true, /*parse_special=*/true};
+        int32_t rc = mtmd_tokenize(mtmd_, chunks, &text,
+                                   const_cast<const mtmd_bitmap**>(bitmaps.data()), bitmaps.size());
+        free_bitmaps();
+        if (rc != 0) {
+            mtmd_input_chunks_free(chunks);
+            throw std::runtime_error(rc == 1 ? "media markers in the prompt don't match the media given"
+                                             : "media preprocessing failed");
+        }
+
+        GenerateResult result;
+        result.prompt_tokens = static_cast<int>(mtmd_helper_get_n_tokens(chunks));
+        std::vector<llama_token> text_tokens;  // for the repetition penalty
+        for (size_t i = 0; i < mtmd_input_chunks_size(chunks); ++i) {
+            size_t n = 0;
+            const llama_token* t = mtmd_input_chunk_get_tokens_text(mtmd_input_chunks_get(chunks, i), &n);
+            if (t) text_tokens.insert(text_tokens.end(), t, t + n);
+        }
+        result.evaluated_tokens = result.prompt_tokens;
+
+        // Media aren't part of the token-based prefix cache: read fresh, and
+        // leave the cache empty afterwards (snapshots of text prompts stay).
+        llama_memory_clear(llama_get_memory(ctx_), true);
+        kv_tokens_.clear();
+
+        if (capture_hidden) {
+            capture_state_.reset_captures();
+            capture_state_.active.store(true, std::memory_order_release);
+        }
+        llama_pos n_past = 0;
+        rc = mtmd_helper_eval_chunks(mtmd_, ctx_, chunks, 0, 0,
+                                     static_cast<int32_t>(llama_n_batch(ctx_)), true, &n_past);
+        if (capture_hidden) capture_state_.active.store(false, std::memory_order_release);
+        mtmd_input_chunks_free(chunks);
+        if (rc != 0) {
+            llama_memory_clear(llama_get_memory(ctx_), true);
+            throw std::runtime_error("evaluating the media prompt failed (rc=" + std::to_string(rc) + ")");
+        }
+        ++stat_requests_;
+        stat_evaluated_ += result.evaluated_tokens;
+
+        llama_sampler* sampler = _build_sampler(temperature, top_p, top_k, text_tokens);
+        std::string full_text;
+        int n_generated = 0;
+        for (int step = 0; step < max_tokens; ++step) {
+            llama_token tok = llama_sampler_sample(sampler, ctx_, -1);
+            if (llama_vocab_is_eog(vocab_, tok)) break;
+            std::string piece = _token_to_piece(tok);
+            full_text += piece;
+            ++n_generated;
+            if (token_cb && !piece.empty()) token_cb(piece);
+            if (capture_hidden) {
+                capture_state_.reset_captures();
+                capture_state_.active.store(true, std::memory_order_release);
+            }
+            llama_batch next = llama_batch_get_one(&tok, 1);
+            int ret = llama_decode(ctx_, next);
+            if (capture_hidden) capture_state_.active.store(false, std::memory_order_release);
+            if (ret != 0) break;
+        }
+        llama_sampler_free(sampler);
+        if (capture_hidden) result.hidden_states = _copy_captures();
+
+        llama_memory_clear(llama_get_memory(ctx_), true);
+        kv_tokens_.clear();
+        result.text = std::move(full_text);
+        result.completion_tokens = n_generated;
+        return result;
     }
 
     // ── KV cache control (d12t) ─────────────────────────────────────────────
@@ -440,6 +588,11 @@ private:
     llama_model* model_ = nullptr;
     llama_context* ctx_ = nullptr;
     const llama_vocab* vocab_ = nullptr;
+
+    // ── Media state (frlp) ────────────────────────────────────────────────
+    mtmd_context* mtmd_ = nullptr;
+    std::string mmproj_path_;
+    float repeat_penalty_ = 1.0f;  // set per request, under inference_mtx_
 
     // ── MTP state (ojwf) ──────────────────────────────────────────────────
     llama_model* mtp_model_ = nullptr;
@@ -602,9 +755,20 @@ private:
     }
 
     // ── Build sampler ─────────────────────────────────────────────────────────
-    llama_sampler* _build_sampler(float temperature, float top_p, int top_k) {
+    // repeat_penalty_ != 1 (frlp): penalize every token already in the
+    // context, prompt included, as HF's RepetitionPenaltyLogitsProcessor does
+    // over input_ids (the GAIA engine's torch path defaults to 1.1). It runs
+    // first, like HF's logits processors before its warpers.
+    llama_sampler* _build_sampler(float temperature, float top_p, int top_k,
+                                  const std::vector<llama_token>& history = {}) {
         llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
         llama_sampler* chain = llama_sampler_chain_init(sparams);
+        const bool penalize = repeat_penalty_ > 0.0f && repeat_penalty_ != 1.0f;
+        if (penalize) {
+            llama_sampler_chain_add(chain, llama_sampler_init_penalties(
+                llama_vocab_n_tokens(vocab_), static_cast<int32_t>(llama_n_ctx(ctx_)),
+                repeat_penalty_, 0.0f, 0.0f));
+        }
 
         if (top_k > 0) {
             llama_sampler_chain_add(chain, llama_sampler_init_top_k(top_k));
@@ -618,6 +782,7 @@ private:
             llama_sampler_chain_add(chain, llama_sampler_init_temp(temperature));
             llama_sampler_chain_add(chain, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
         }
+        if (penalize) for (llama_token t : history) llama_sampler_accept(chain, t);
         return chain;
     }
 
@@ -696,7 +861,7 @@ private:
         }
 
         // ── Autoregressive generation loop ────────────────────────────────
-        llama_sampler* sampler = _build_sampler(temperature, top_p, top_k);
+        llama_sampler* sampler = _build_sampler(temperature, top_p, top_k, prompt_tokens);
         std::string full_text;
         int n_generated = 0;
 
@@ -831,7 +996,7 @@ private:
         common_speculative_begin(spec_, seq, prompt_tgt);
 
         // ── Draft / verify loop ────────────────────────────────────────────
-        llama_sampler* sampler = _build_sampler(temperature, top_p, top_k);
+        llama_sampler* sampler = _build_sampler(temperature, top_p, top_k, prompt_tokens);
         llama_token id_last = prompt_tokens.back();
         int n_past = static_cast<int>(n_head);
         const int n_ctx = static_cast<int>(llama_n_ctx(ctx_));
@@ -970,7 +1135,8 @@ PYBIND11_MODULE(gaia_cpp, m) {
                float temperature,
                float top_p,
                int top_k,
-               bool capture_hidden) {
+               bool capture_hidden,
+               float repeat_penalty) {
                 // pybind11 holds the GIL when entering this lambda.
                 // Release it during the C++ inference loop so other Python
                 // threads can run. The GIL is re-acquired when the
@@ -979,7 +1145,8 @@ PYBIND11_MODULE(gaia_cpp, m) {
                 GenerateResult result;
                 {
                     py::gil_scoped_release release;
-                    result = self.generate(prompt, max_tokens, temperature, top_p, top_k, capture_hidden);
+                    result = self.generate(prompt, max_tokens, temperature, top_p, top_k, capture_hidden,
+                                           repeat_penalty);
                 }
                 return result;
             },
@@ -988,7 +1155,8 @@ PYBIND11_MODULE(gaia_cpp, m) {
             py::arg("temperature")    = 0.7f,
             py::arg("top_p")          = 0.9f,
             py::arg("top_k")          = 0,
-            py::arg("capture_hidden") = false)
+            py::arg("capture_hidden") = false,
+            py::arg("repeat_penalty") = 1.0f)
 
         .def("generate_stream",
             [](LlamaCppBackend& self,
@@ -998,7 +1166,8 @@ PYBIND11_MODULE(gaia_cpp, m) {
                float temperature,
                float top_p,
                int top_k,
-               bool capture_hidden) {
+               bool capture_hidden,
+               float repeat_penalty) {
                 // The token callback fires from C++ while the GIL is released.
                 // It must re-acquire the GIL to call back into Python.
                 // py::gil_scoped_acquire is the pybind11-native way to do this.
@@ -1012,7 +1181,8 @@ PYBIND11_MODULE(gaia_cpp, m) {
                 {
                     py::gil_scoped_release release;
                     result = self.generate_stream(
-                        prompt, cpp_callback, max_tokens, temperature, top_p, top_k, capture_hidden);
+                        prompt, cpp_callback, max_tokens, temperature, top_p, top_k, capture_hidden,
+                        repeat_penalty);
                 }
                 return result;
             },
@@ -1022,7 +1192,8 @@ PYBIND11_MODULE(gaia_cpp, m) {
             py::arg("temperature")    = 0.7f,
             py::arg("top_p")          = 0.9f,
             py::arg("top_k")          = 0,
-            py::arg("capture_hidden") = false)
+            py::arg("capture_hidden") = false,
+            py::arg("repeat_penalty") = 1.0f)
 
         .def("load_lora",  &LlamaCppBackend::load_lora,
             py::arg("path"), py::arg("scale") = 1.0f)
@@ -1044,6 +1215,38 @@ PYBIND11_MODULE(gaia_cpp, m) {
         .def("disable_mtp",        &LlamaCppBackend::disable_mtp,
              py::call_guard<py::gil_scoped_release>())
         .def("mtp_stats",          &LlamaCppBackend::mtp_stats)
+        // frlp: images and audio via libmtmd
+        .def("load_mmproj",        &LlamaCppBackend::load_mmproj,
+             py::arg("path"), py::arg("image_tokens") = 0,
+             py::call_guard<py::gil_scoped_release>())
+        .def("media_marker",       &LlamaCppBackend::media_marker)
+        .def("media_info",         &LlamaCppBackend::media_info)
+        .def("generate_media",
+            [](LlamaCppBackend& self,
+               const std::string& prompt,
+               std::vector<std::string> media,      // file bytes (bytes objects)
+               py::object token_callback,           // None for non-streaming
+               int max_tokens, float temperature, float top_p, int top_k,
+               bool capture_hidden, float repeat_penalty) {
+                std::function<void(const std::string&)> cb;
+                if (!token_callback.is_none()) {
+                    cb = [&token_callback](const std::string& delta) {
+                        py::gil_scoped_acquire acquire;
+                        try { token_callback(py::cast(delta)); } catch (...) {}
+                    };
+                }
+                GenerateResult result;
+                {
+                    py::gil_scoped_release release;
+                    result = self.generate_media(prompt, media, cb, max_tokens, temperature, top_p,
+                                                 top_k, capture_hidden, repeat_penalty);
+                }
+                return result;
+            },
+            py::arg("prompt"), py::arg("media"), py::arg("token_callback") = py::none(),
+            py::arg("max_tokens") = 512, py::arg("temperature") = 0.7f, py::arg("top_p") = 0.9f,
+            py::arg("top_k") = 0, py::arg("capture_hidden") = false,
+            py::arg("repeat_penalty") = 1.0f)
 
         .def("n_vocab",         &LlamaCppBackend::n_vocab)
         .def("n_embd",          &LlamaCppBackend::n_embd)

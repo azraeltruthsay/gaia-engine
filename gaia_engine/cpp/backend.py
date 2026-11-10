@@ -111,6 +111,31 @@ def _write_activation(tier: str, token: str, token_idx: int,
 from gaia_engine.thoughts import split_thought_text as _split_thought_text  # noqa: E402
 
 
+def _media_bytes(part: dict) -> Optional[bytes]:
+    """File bytes of an OpenAI-style image/audio content part, or None if the
+    part isn't media. Accepts image_url / audio_url ({"url": ...} or a bare
+    string; a data: URI or a local path, as the HF engine path does) and
+    input_audio ({"data": base64, "format": ...})."""
+    import base64
+    ptype = part.get("type", "")
+    if ptype == "input_audio":
+        return base64.b64decode(part.get("input_audio", {}).get("data", ""))
+    if ptype not in ("image_url", "audio_url"):
+        return None
+    url = part.get(ptype, "")
+    if isinstance(url, dict):
+        url = url.get("url", "")
+    if url.startswith("data:"):
+        head, _, data = url.partition(",")
+        if ";base64" not in head:
+            raise ValueError("data URI is not base64")
+        return base64.b64decode(data)
+    if url.startswith("/") and os.path.isfile(url):
+        with open(url, "rb") as f:
+            return f.read()
+    raise ValueError(f"unsupported media url: {url[:40]}")
+
+
 class GaiaCppBackendAdapter:
     """
     In-process GGUF backend using gaia_cpp C++ extension.
@@ -200,6 +225,27 @@ class GaiaCppBackendAdapter:
         else:
             logger.info("gaia_cpp: extension predates KV control (d12t); every request reads its full prompt")
 
+        # frlp: images and audio. GAIA_CPP_MMPROJ names the projector GGUF
+        # exported from the same weights as the model; GAIA_CPP_IMAGE_TOKENS
+        # pins every image to that many tokens (Gemma 4 12B: 280, as its HF
+        # processor does; 0 = the projector's own default).
+        self._media_marker = ""
+        mmproj = os.environ.get("GAIA_CPP_MMPROJ", "")
+        if mmproj:
+            if not hasattr(self._backend, "load_mmproj"):
+                logger.warning("gaia_cpp: GAIA_CPP_MMPROJ set, but this extension predates media support")
+            elif not os.path.exists(mmproj):
+                logger.warning("gaia_cpp: projector %s not found; text only", mmproj)
+            else:
+                err = self._backend.load_mmproj(mmproj, int(os.environ.get("GAIA_CPP_IMAGE_TOKENS", "0")))
+                if err:
+                    logger.warning("gaia_cpp: projector not loaded (%s); text only", err)
+                else:
+                    self._media_marker = self._backend.media_marker()
+                    info = self._backend.media_info()
+                    logger.info("gaia_cpp: projector %s (vision=%s, audio=%s)",
+                                mmproj, info["vision"], info["audio"])
+
         # ojwf: MTP speculative decoding. GAIA_CPP_MTP_DRAFT names a draft
         # "assistant" GGUF made for this model (Gemma 4 12B:
         # google/gemma-4-12B-it-assistant); GAIA_CPP_MTP_N is the draft length.
@@ -235,6 +281,7 @@ class GaiaCppBackendAdapter:
             "lora_path":   self._lora_path,
             "kv":          self.kv_stats(),
             "mtp":         self.mtp_stats(),
+            "media":       (self._backend.media_info() if hasattr(self._backend, "media_info") else {}),
         }
 
     def mtp_stats(self) -> dict:
@@ -317,6 +364,19 @@ class GaiaCppBackendAdapter:
                          f"; MTP {result.draft_accepted}/{result.draft_tokens} drafted accepted"
                          if getattr(result, "draft_tokens", 0) else "")
 
+    @staticmethod
+    def _call(fn, repetition_penalty: float, *args):
+        """Call a generate function with the repetition penalty (frlp) as its
+        last argument; an extension built before it takes one argument fewer."""
+        if repetition_penalty == 1.0:
+            return fn(*args)
+        try:
+            return fn(*args, repetition_penalty)
+        except TypeError as e:
+            if "incompatible function arguments" not in str(e):
+                raise
+            return fn(*args)
+
     # ── Streaming generation ──────────────────────────────────────────────────
 
     def stream_to_writer(
@@ -327,6 +387,7 @@ class GaiaCppBackendAdapter:
         top_p: float = 0.9,
         session_id: str = "",
         write_fn=None,
+        repetition_penalty: float = 1.0,
     ) -> None:
         """
         Stream SSE directly to write_fn.  No daemon thread, no generator.
@@ -337,7 +398,8 @@ class GaiaCppBackendAdapter:
         This is the primary streaming path used by _proxy_stream_cpp().
         Writes activation JSONL after generation completes.
         """
-        prompt = self._build_prompt(messages)
+        media: list = []
+        prompt = self._build_prompt(messages, media=media)
         gen_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
         def token_callback(delta: str) -> None:
@@ -351,15 +413,15 @@ class GaiaCppBackendAdapter:
             write_fn(f"data: {json.dumps(chunk)}\n\n".encode())
 
         with self._request_lock:
-            result = self._backend.generate_stream(
-                prompt,
-                token_callback,
-                max_tokens,
-                temperature,
-                top_p,
-                0,      # top_k
-                bool(self.capture_layers),
-            )
+            if media:
+                result = self._call(self._backend.generate_media, repetition_penalty,
+                                    prompt, media, token_callback, max_tokens, temperature, top_p, 0,
+                                    bool(self.capture_layers))
+            else:
+                result = self._call(self._backend.generate_stream, repetition_penalty,
+                                    prompt, token_callback, max_tokens, temperature, top_p,
+                                    0,  # top_k
+                                    bool(self.capture_layers))
         self._log_reuse(result)
 
         # Write activation log from final result (hidden states of last token)
@@ -420,15 +482,21 @@ class GaiaCppBackendAdapter:
         temperature: float = 0.7,
         top_p: float = 0.9,
         enable_thinking: bool = True,
+        repetition_penalty: float = 1.0,
     ) -> dict:
         """Non-streaming generation, returns OpenAI-compatible JSON dict."""
-        prompt = self._build_prompt(messages, enable_thinking=enable_thinking)
+        media: list = []
+        prompt = self._build_prompt(messages, enable_thinking=enable_thinking, media=media)
 
         with self._request_lock:
-            result = self._backend.generate(
-                prompt, max_tokens, temperature, top_p, 0,
-                bool(self.capture_layers),
-            )
+            if media:
+                result = self._call(self._backend.generate_media, repetition_penalty,
+                                    prompt, media, None, max_tokens, temperature, top_p, 0,
+                                    bool(self.capture_layers))
+            else:
+                result = self._call(self._backend.generate, repetition_penalty,
+                                    prompt, max_tokens, temperature, top_p, 0,
+                                    bool(self.capture_layers))
         self._log_reuse(result)
 
         # The native thought (Gemma 4 channel or Qwen3 <think>, closed or cut
@@ -494,7 +562,40 @@ class GaiaCppBackendAdapter:
         return family
 
 
-    def _build_prompt(self, messages: list, enable_thinking: bool = True) -> str:
+    def _content(self, content, media: Optional[list]) -> str:
+        """A message's content as prompt text. A list of OpenAI-style parts
+        (frlp) gives its text parts in order; each image or audio part becomes
+        the projector's media marker, with the file's bytes appended to
+        `media`, when a projector is loaded and `media` is given. Otherwise
+        media parts are left out (they used to reach the prompt as a Python
+        list repr)."""
+        if not isinstance(content, list):
+            return "" if content is None else str(content)
+        marker = getattr(self, "_media_marker", "") if media is not None else ""
+        out = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            ptype = part.get("type", "")
+            if ptype == "text":
+                out.append(part.get("text", ""))
+                continue
+            data = None
+            try:
+                data = _media_bytes(part)
+            except Exception as e:  # undecodable media: say so in place
+                logger.warning("gaia_cpp: media part not decoded: %s", e)
+            if data is None:
+                continue
+            if marker:
+                media.append(data)
+                out.append(marker)
+            else:
+                logger.warning("gaia_cpp: %s part dropped (no projector loaded)", ptype)
+        return "".join(out)
+
+    def _build_prompt(self, messages: list, enable_thinking: bool = True,
+                      media: Optional[list] = None) -> str:
         """Build formatted prompt for the model family.
 
         Currently supports ChatML (Qwen) and Gemma 4 turn format.
@@ -502,7 +603,11 @@ class GaiaCppBackendAdapter:
 
         When enable_thinking=False, injects an empty think block after the
         assistant start token to suppress chain-of-thought mode.
+
+        `media` (frlp): pass a list to collect image/audio bytes for
+        generate_media(); the prompt then carries a marker for each.
         """
+        messages = [{**m, "content": self._content(m.get("content", ""), media)} for m in messages]
         is_gemma = self._family() == "gemma"
 
         if is_gemma and getattr(self, "prompt_format", "house") == "stock":

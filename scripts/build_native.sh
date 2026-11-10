@@ -45,7 +45,7 @@ trap 'docker rm -f "$CID" >/dev/null 2>&1 || true; rm -rf "$STAGE"' EXIT
 echo "Extracting gaia_cpp from $IMAGE ..."
 docker cp "$CID:$SITE/gaia_cpp.cpython-311-x86_64-linux-gnu.so" "$STAGE/"
 mkdir -p "$STAGE/lib"
-for lib in libllama.so.0 libllama-common.so.0 libggml.so.0 libggml-base.so.0 libggml-cpu.so.0 libggml-cuda.so.0; do
+for lib in libllama.so.0 libllama-common.so.0 libmtmd.so.0 libggml.so.0 libggml-base.so.0 libggml-cpu.so.0 libggml-cuda.so.0; do
     # docker cp follows the soname symlink to the real file
     docker cp -L "$CID:/usr/local/lib/$lib" "$STAGE/lib/$lib"
 done

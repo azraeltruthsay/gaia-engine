@@ -132,6 +132,18 @@ def _wait_for_health(port: int, timeout: int = 180) -> bool:
     return False
 
 
+def _repetition_penalty(req: dict) -> float:
+    """The repetition penalty a request gets, worked out as the torch worker
+    does (core.py /v1/chat/completions): an explicit repetition_penalty, else
+    1 + 0.1 x frequency_penalty, else 1.1. Applied by gaia_cpp too since frlp,
+    so the GGUF path samples like the torch path."""
+    rp = req.get("repetition_penalty")
+    if rp is not None:
+        return float(rp)
+    fp = req.get("frequency_penalty", 0.0)
+    return 1.0 + max(0.0, float(fp)) * 0.1 if fp else 1.1
+
+
 class EngineManager:
     """Zero-GPU engine manager with subprocess isolation."""
 
@@ -1005,6 +1017,7 @@ class EngineManager:
                 result = cpp.generate_json(
                     messages, max_tokens, temperature, top_p,
                     enable_thinking=enable_thinking,
+                    repetition_penalty=_repetition_penalty(req_data),
                 )
                 # gaia_cpp can't stop on strings; honour `stop` afterwards
                 # so callers get the same text as from the torch worker.
@@ -1400,6 +1413,7 @@ class ManagedEngineHandler(BaseHTTPRequestHandler):
             cpp.stream_to_writer(
                 messages, max_tokens, temperature, top_p, session_id,
                 write_fn=write_fn,
+                repetition_penalty=_repetition_penalty(req_data),
             )
 
         except Exception as e:

@@ -111,7 +111,8 @@ public:
         std::vector<int> capture_layers,
         int n_ctx,
         int n_threads,
-        int n_threads_batch
+        int n_threads_batch,
+        const std::string& kv_type
     )
         : model_path_(model_path), n_gpu_layers_(n_gpu_layers)
     {
@@ -136,6 +137,21 @@ public:
             ? n_threads
             : static_cast<int>(std::thread::hardware_concurrency() / 2);
         cparams.n_threads_batch = (n_threads_batch > 0) ? n_threads_batch : cparams.n_threads;
+
+        // KV cache precision (frlp): "f16" (default) or "q8_0", which halves
+        // the cache (12B at 8k context: 2.5 -> ~1.3 GB of VRAM). A quantized V
+        // cache needs flash attention, so it is switched on explicitly.
+        if (!kv_type.empty() && kv_type != "f16") {
+            ggml_type t;
+            if (kv_type == "q8_0") t = GGML_TYPE_Q8_0;
+            else if (kv_type == "bf16") t = GGML_TYPE_BF16;
+            else if (kv_type == "f32") t = GGML_TYPE_F32;
+            else throw std::runtime_error("unsupported kv_type '" + kv_type + "' (f16, q8_0, bf16, f32)");
+            cparams.type_k = t;
+            cparams.type_v = t;
+            cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
+        kv_type_ = kv_type.empty() ? "f16" : kv_type;
 
         // Register the hidden state eval callback
         capture_state_.capture_layers = std::move(capture_layers);
@@ -551,8 +567,9 @@ public:
     int n_vocab()       const { return llama_vocab_n_tokens(vocab_); }
     int n_embd()        const { return llama_model_n_embd(model_); }
     int n_layer()       const { return llama_model_n_layer(model_); }
-    bool has_gpu()      const { return false; } // TODO Phase 5: check via llama_model GPU offload state
+    bool has_gpu()      const { return n_gpu_layers_ != 0; }  // layers offloaded (frlp; was a TODO returning false)
     std::string model_path() const { return model_path_; }
+    std::string kv_type() const { return kv_type_; }
 
     // GGUF general.architecture ("gemma4", "qwen3vl", ...): the prompt format
     // follows the model, not its file name (a symlink like core.gguf says
@@ -584,6 +601,7 @@ public:
 
 private:
     std::string model_path_;
+    std::string kv_type_ = "f16";
     int n_gpu_layers_ = 0;
     llama_model* model_ = nullptr;
     llama_context* ctx_ = nullptr;
@@ -1120,13 +1138,14 @@ PYBIND11_MODULE(gaia_cpp, m) {
         });
 
     py::class_<LlamaCppBackend>(m, "LlamaCppBackend")
-        .def(py::init<const std::string&, int, std::vector<int>, int, int, int>(),
+        .def(py::init<const std::string&, int, std::vector<int>, int, int, int, const std::string&>(),
             py::arg("model_path"),
             py::arg("n_gpu_layers")   = 0,
             py::arg("capture_layers") = std::vector<int>{},
             py::arg("n_ctx")          = 4096,
             py::arg("n_threads")      = -1,
-            py::arg("n_threads_batch") = -1)
+            py::arg("n_threads_batch") = -1,
+            py::arg("kv_type")        = std::string("f16"))
 
         .def("generate",
             [](LlamaCppBackend& self,
@@ -1253,6 +1272,7 @@ PYBIND11_MODULE(gaia_cpp, m) {
         .def("n_layer",         &LlamaCppBackend::n_layer)
         .def("has_gpu",         &LlamaCppBackend::has_gpu)
         .def("model_path",      &LlamaCppBackend::model_path)
+        .def("kv_type",         &LlamaCppBackend::kv_type)
         .def("architecture",    &LlamaCppBackend::architecture)
         .def("capture_layers",  &LlamaCppBackend::capture_layers)
         .def("set_capture_layers", &LlamaCppBackend::set_capture_layers)

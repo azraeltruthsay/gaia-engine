@@ -174,13 +174,26 @@ class GaiaCppBackendAdapter:
         )
 
         # Create C++ backend with empty capture layers initially. ojwf: the
-        # prompt-read thread count is separate since the b11804 build; an
-        # older extension takes five arguments and reads with n_threads.
-        try:
-            self._backend = LlamaCppBackend(
-                model_path, n_gpu_layers, [], n_ctx, n_threads, n_threads_batch)
-        except TypeError:
-            self._backend = LlamaCppBackend(model_path, n_gpu_layers, [], n_ctx, n_threads)
+        # prompt-read thread count is separate since the b11804 build; frlp:
+        # GAIA_CPP_KV_TYPE sets the KV cache precision (f16 default, q8_0
+        # halves it). Older extensions take fewer arguments: drop from the end.
+        # GAIA_CPP_KV_TYPE_GPU applies when layers are on the GPU (VRAM is the
+        # scarce one there); GAIA_CPP_KV_TYPE otherwise / as the fallback.
+        kv_type = ((os.environ.get("GAIA_CPP_KV_TYPE_GPU") if n_gpu_layers else None)
+                   or os.environ.get("GAIA_CPP_KV_TYPE", "f16") or "f16")
+        args = [model_path, n_gpu_layers, [], n_ctx, n_threads, n_threads_batch, kv_type]
+        while True:
+            try:
+                self._backend = LlamaCppBackend(*args)
+                break
+            except TypeError:
+                if len(args) <= 5:
+                    raise
+                if len(args) == 7 and kv_type != "f16":
+                    logger.warning("gaia_cpp: GAIA_CPP_KV_TYPE=%s ignored (extension predates it)", kv_type)
+                args.pop()
+        if hasattr(self._backend, "kv_type"):
+            logger.info("gaia_cpp: KV cache %s", self._backend.kv_type())
 
         # Resolve capture layers based on actual model depth
         n_layers = self._backend.n_layer()
@@ -280,6 +293,7 @@ class GaiaCppBackendAdapter:
             "lora_active": self._backend.active_adapter_count(),
             "lora_path":   self._lora_path,
             "kv":          self.kv_stats(),
+            "kv_type":     (self._backend.kv_type() if hasattr(self._backend, "kv_type") else "f16"),
             "mtp":         self.mtp_stats(),
             "media":       (self._backend.media_info() if hasattr(self._backend, "media_info") else {}),
         }

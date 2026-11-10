@@ -10,6 +10,10 @@ import os
 # ── Inference ────────────────────────────────────────────────────────────────
 
 GGUF_CTX_SIZE: int = int(os.environ.get("GGUF_CTX_SIZE", os.environ.get("CORE_CPU_CTX", "16384")))
+# Context for a GGUF model loaded onto the GPU (0 = GGUF_CTX_SIZE). The KV cache
+# is reserved up front, so VRAM, not RAM, pays for it: Gemma 4 12B at 8192 with
+# a q8_0 cache is ~1.4 GB (frlp). Core's real prompts peak around 5k tokens.
+GGUF_CTX_SIZE_GPU: int = int(os.environ.get("GGUF_CTX_SIZE_GPU", "0"))
 GGUF_THREADS: int = int(os.environ.get("GGUF_THREADS", "16"))
 # Threads for reading the prompt (-1 = same as GGUF_THREADS). Generation is
 # memory-bandwidth bound and peaks near the physical core count; prompt reading

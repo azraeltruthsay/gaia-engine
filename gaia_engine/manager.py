@@ -211,11 +211,11 @@ class EngineManager:
             if is_gguf:
                 # GGUF: try gaia_cpp in-process backend first (hidden states + speed)
                 # Falls back to llama-server subprocess if unavailable.
-                from gaia_engine.config import GGUF_CTX_SIZE, GGUF_THREADS, GGUF_THREADS_BATCH, ENGINE_TIER, GGUF_GPU_LAYERS
+                from gaia_engine.config import GGUF_CTX_SIZE, GGUF_CTX_SIZE_GPU, GGUF_THREADS, GGUF_THREADS_BATCH, ENGINE_TIER, GGUF_GPU_LAYERS
                 # 999 = all layers; Gemma 4 GGUF needs (num_layers - 1) on CUDA
                 # to avoid a final-layer CUDA abort — see config.GGUF_GPU_LAYERS.
                 n_gpu_layers = GGUF_GPU_LAYERS if device == "cuda" else 0
-                ctx_size = GGUF_CTX_SIZE
+                ctx_size = GGUF_CTX_SIZE_GPU if (n_gpu_layers > 0 and GGUF_CTX_SIZE_GPU > 0) else GGUF_CTX_SIZE
                 threads = GGUF_THREADS
                 tier = ENGINE_TIER
 

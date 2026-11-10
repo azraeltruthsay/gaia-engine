@@ -115,3 +115,37 @@ def test_mtp_stats_never_wait_on_a_running_request():
     with a._request_lock:
         got = a.mtp_stats()
     assert got["accepted_total"] == 7 and got["busy"] is True
+
+
+class KvExt(FakeExt):
+    """b11804 + frlp build: a seventh constructor argument, the KV cache type."""
+
+    def __init__(self, model_path, n_gpu_layers, capture_layers, n_ctx, n_threads, n_threads_batch, kv_type):
+        super().__init__(model_path, n_gpu_layers, capture_layers, n_ctx, n_threads, n_threads_batch)
+        self.kv = kv_type
+
+    def kv_type(self):
+        return self.kv
+
+
+def test_kv_type_from_env(ext):
+    ext.setattr(backend, "LlamaCppBackend", KvExt)
+    ext.setenv("GAIA_CPP_KV_TYPE", "q8_0")
+    a = _make(n_threads_batch=24)
+    assert a._backend.kv == "q8_0" and a.health()["kv_type"] == "q8_0"
+
+
+def test_kv_type_dropped_for_older_extension(ext):
+    ext.setattr(backend, "LlamaCppBackend", FakeExt)   # six-argument build
+    ext.setenv("GAIA_CPP_KV_TYPE", "q8_0")
+    a = _make(n_threads_batch=24)
+    assert a._backend.args[3:] == (12, 24)
+
+
+def test_gpu_kv_type_only_on_gpu(ext):
+    ext.setattr(backend, "LlamaCppBackend", KvExt)
+    ext.setenv("GAIA_CPP_KV_TYPE_GPU", "q8_0")
+    ext.delenv("GAIA_CPP_KV_TYPE", raising=False)
+    gpu = backend.GaiaCppBackendAdapter("/models/core.gguf", n_gpu_layers=999, n_threads=12)
+    cpu = backend.GaiaCppBackendAdapter("/models/core.gguf", n_gpu_layers=0, n_threads=12)
+    assert gpu._backend.kv == "q8_0" and cpu._backend.kv == "f16"

@@ -55,6 +55,7 @@
 #include <functional>
 #include <mutex>
 #include <stdexcept>
+#include <cstdlib>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -85,6 +86,28 @@ static size_t gaia_gpu_free_bytes() {
         }
     }
     return 0;
+}
+// A CPU-gear model touches no GPU at all (2026-11-11). With CUDA up in the
+// process, n_gpu_layers=0 still reserved ~1.9 GB of CUDA compute buffers for
+// op offload; the gearbox counted that as an outside tenant and refused every
+// wake from park. Hiding CUDA from the process instead (the old way) blinded
+// it for good: CUDA initialises once, so a later GPU load ran on the CPU.
+// GAIA_CPP_CPU_OP_OFFLOAD=1 keeps the GPU-assisted prompt pass for CPU loads.
+static ggml_backend_dev_t gaia_no_devices[] = { nullptr };
+static bool gaia_cpu_op_offload() {
+    const char* v = std::getenv("GAIA_CPP_CPU_OP_OFFLOAD");
+    return v && *v && std::string(v) != "0";
+}
+static bool gaia_gpu_visible() {
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i)
+        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) return true;
+    return false;
+}
+static void gaia_cpu_only(llama_model_params& m) {
+    if (!gaia_cpu_op_offload()) m.devices = gaia_no_devices;
+}
+static void gaia_cpu_only(llama_context_params& c) {
+    if (!gaia_cpu_op_offload()) { c.offload_kqv = false; c.op_offload = false; }
 }
 static long long gaia_gpu_delta(size_t before) {
     size_t after = gaia_gpu_free_bytes();
@@ -138,11 +161,14 @@ public:
         : model_path_(model_path), n_gpu_layers_(n_gpu_layers)
     {
         llama_backend_init();
-        const size_t gpu_free0 = n_gpu_layers != 0 ? gaia_gpu_free_bytes() : 0;
+        if (n_gpu_layers != 0 && !gaia_gpu_visible())
+            throw std::runtime_error("GPU load asked for, but this process sees no GPU");
+        const size_t gpu_free0 = gaia_gpu_free_bytes();
 
         // ── Model params ────────────────────────────────────────────────────
         llama_model_params mparams = llama_model_default_params();
         mparams.n_gpu_layers = n_gpu_layers;
+        if (n_gpu_layers == 0) gaia_cpu_only(mparams);
 
         model_ = llama_model_load_from_file(model_path.c_str(), mparams);
         if (!model_) {
@@ -150,6 +176,16 @@ public:
         }
 
         vocab_ = llama_model_get_vocab(model_);
+        // In the house format a turn has no closer: the next one opens with
+        // <|turn>. Gemma's vocab doesn't mark it EOG, so a reply could run on
+        // into an invented "user" turn ("Augustus. user\nHow many sides does a
+        // heptagon have?. Seven.", 2026-11-11). It ends her turn here.
+        {
+            llama_token t[4];
+            const char* opener = "<|turn>";
+            int n = llama_tokenize(vocab_, opener, (int)std::strlen(opener), t, 4, false, true);
+            turn_open_ = (n == 1) ? t[0] : LLAMA_TOKEN_NULL;
+        }
 
         // ── Context params ─────────────────────────────────────────────────
         llama_context_params cparams = llama_context_default_params();
@@ -159,6 +195,7 @@ public:
             ? n_threads
             : static_cast<int>(std::thread::hardware_concurrency() / 2);
         cparams.n_threads_batch = (n_threads_batch > 0) ? n_threads_batch : cparams.n_threads;
+        if (n_gpu_layers == 0) gaia_cpu_only(cparams);
 
         // KV cache precision (frlp): "f16" (default) or "q8_0", which halves
         // the cache (12B at 8k context: 2.5 -> ~1.3 GB of VRAM). A quantized V
@@ -185,7 +222,7 @@ public:
             llama_model_free(model_);
             throw std::runtime_error("Failed to create llama context");
         }
-        if (n_gpu_layers != 0) vram_main_ = gaia_gpu_delta(gpu_free0);
+        vram_main_ = gaia_gpu_delta(gpu_free0);
     }
 
     ~LlamaCppBackend() {
@@ -300,10 +337,11 @@ public:
     std::string enable_mtp(const std::string& draft_path, int n_max) {
         std::lock_guard<std::mutex> lock(inference_mtx_);
         _free_mtp();
-        const size_t gpu_free0 = n_gpu_layers_ != 0 ? gaia_gpu_free_bytes() : 0;
+        const size_t gpu_free0 = gaia_gpu_free_bytes();
 
         llama_model_params mparams = llama_model_default_params();
         mparams.n_gpu_layers = n_gpu_layers_;
+        if (n_gpu_layers_ == 0) gaia_cpu_only(mparams);
         mtp_model_ = llama_model_load_from_file(draft_path.c_str(), mparams);
         if (!mtp_model_) return "could not load draft model " + draft_path;
 
@@ -325,6 +363,7 @@ public:
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         cparams.ctx_other = ctx_;
         cparams.n_rs_seq = 0;
+        if (n_gpu_layers_ == 0) gaia_cpu_only(cparams);
         mtp_ctx_ = llama_init_from_model(mtp_model_, cparams);
         if (!mtp_ctx_) { _free_mtp(); return "could not create the MTP draft context"; }
 
@@ -346,7 +385,7 @@ public:
 
         mtp_n_max_ = sp.draft.n_max;
         mtp_path_ = draft_path;
-        if (n_gpu_layers_ != 0) vram_mtp_ = gaia_gpu_delta(gpu_free0);
+        vram_mtp_ = gaia_gpu_delta(gpu_free0);
         _invalidate_kv();
         return "";
     }
@@ -483,7 +522,7 @@ public:
         int n_generated = 0;
         for (int step = 0; step < max_tokens; ++step) {
             llama_token tok = llama_sampler_sample(sampler, ctx_, -1);
-            if (llama_vocab_is_eog(vocab_, tok)) break;
+            if (_ends_turn(tok)) break;
             std::string piece = _token_to_piece(tok);
             full_text += piece;
             ++n_generated;
@@ -637,6 +676,10 @@ private:
     llama_model* model_ = nullptr;
     llama_context* ctx_ = nullptr;
     const llama_vocab* vocab_ = nullptr;
+    llama_token turn_open_ = LLAMA_TOKEN_NULL;
+    bool _ends_turn(llama_token t) const {
+        return llama_vocab_is_eog(vocab_, t) || (turn_open_ != LLAMA_TOKEN_NULL && t == turn_open_);
+    }
 
     // ── Media state (frlp) ────────────────────────────────────────────────
     mtmd_context* mtmd_ = nullptr;
@@ -918,7 +961,7 @@ private:
         for (int step = 0; step < max_tokens; ++step) {
             llama_token tok = llama_sampler_sample(sampler, ctx_, -1);
 
-            if (llama_vocab_is_eog(vocab_, tok)) {
+            if (_ends_turn(tok)) {
                 break;
             }
 
@@ -1106,7 +1149,7 @@ private:
             prompt_tgt.push_back(id_last);  // in the KV
             for (size_t i = 0; i < ids.size(); ++i) {
                 id_last = ids[i];
-                if (llama_vocab_is_eog(vocab_, id_last)) { done = true; break; }
+                if (_ends_turn(id_last)) { done = true; break; }
                 std::string piece = _token_to_piece(id_last);
                 full_text += piece;
                 ++n_generated;

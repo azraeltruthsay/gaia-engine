@@ -229,14 +229,13 @@ class EngineManager:
                 threads = GGUF_THREADS
                 tier = ENGINE_TIER
 
-                # Hide/restore GPU visibility in environment before loading C++ bindings
-                # to prevent allocating CUDA contexts on CPU. Empty-string-is-absent
-                # semantics (3tch) — see _hide_cuda/_expose_cuda.
+                # gaia_cpp runs in this process, and CUDA initialises once per
+                # process: masking it here for a CPU load blinded every later GPU
+                # load (booted parked, "gear 1" Core ran on the CPU, 2026-11-11).
+                # gaia_cpp keeps a CPU load off the GPU itself; the llama-server
+                # fallback below still gets a masked env of its own.
                 if n_gpu_layers > 0:
                     _expose_cuda(os.environ)
-                else:
-                    _hide_cuda(os.environ)
-                    self._own_cuda_masked = True
 
                 try:
                     from gaia_engine.cpp import is_available, GaiaCppBackendAdapter

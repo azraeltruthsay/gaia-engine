@@ -174,6 +174,15 @@ class EngineManager:
         self.event_callback = event_callback
         self._lock = threading.Lock()
         self._respawn_lock = threading.Lock()
+        # uxfh: one load or swap at a time. Two interleaved swaps let a
+        # timed-out one stop the worker the newer one had started. Reentrant:
+        # swap_worker calls start_worker under it.
+        self._op_lock = threading.RLock()
+        # uxfh: what a load in progress is loading ({model_path, device, since}),
+        # so /health says "loading" instead of "standby" and the orchestrator
+        # doesn't reconcile with a swap of its own mid-load. Read without
+        # _lock: an in-process gaia_cpp load holds _lock until it finishes.
+        self._loading = None
         self._prompt_format = "house"
         self._last_respawn = 0.0
         # Inference queue: limits concurrent requests to the worker.
@@ -198,6 +207,18 @@ class EngineManager:
     def start_worker(self, model_path: str, device: str = "cuda",
                      compile_mode: str = "reduce-overhead",
                      quantize: str = "", prompt_format: str = "house") -> dict:
+        """Load a model (see _start_worker), one operation at a time, with
+        /health reporting the load while it runs (uxfh)."""
+        with self._op_lock:
+            self._loading = {"model_path": model_path, "device": device, "since": time.time()}
+            try:
+                return self._start_worker(model_path, device, compile_mode, quantize, prompt_format)
+            finally:
+                self._loading = None
+
+    def _start_worker(self, model_path: str, device: str = "cuda",
+                      compile_mode: str = "reduce-overhead",
+                      quantize: str = "", prompt_format: str = "house") -> dict:
         """Spawn a worker subprocess with the GAIA Engine.
 
         If model_path ends in .gguf, spawns llama-server instead of the
@@ -316,6 +337,7 @@ class EngineManager:
                 stderr=subprocess.PIPE,
                 env=env,
             )
+            proc = self.worker_process  # uxfh: the worker THIS call owns
 
             # Stream worker stdout/stderr to our logger
             self._worker_stdout_thread = threading.Thread(
@@ -331,8 +353,8 @@ class EngineManager:
         logger.info("Waiting for worker health on port %d...", internal_port)
         if _wait_for_health(internal_port, timeout=180):
             with self._lock:
-                # Check worker didn't die while we waited
-                if self.worker_process is not None and self.worker_process.poll() is None:
+                # Check our worker didn't die, or get replaced, while we waited
+                if self.worker_process is proc and proc.poll() is None:
                     self.worker_port = internal_port
                     self.model_path = model_path
                     self.device = device
@@ -342,13 +364,27 @@ class EngineManager:
                 else:
                     return {"ok": False, "error": "worker process died during startup"}
         else:
-            # Worker failed to start — clean up
-            logger.error("Worker failed to become healthy within timeout")
-            self._kill_worker_process()
-            return {"ok": False, "error": "worker failed to start within 180s"}
+            # Worker failed to start — clean up OUR worker only. uxfh: this
+            # used to kill whatever was current, which by then was the worker
+            # a newer swap had started.
+            logger.error("Worker PID %d failed to become healthy within timeout", proc.pid)
+            with self._lock:
+                if self.worker_process is proc:
+                    self._kill_worker_process()
+                    self._cleanup_worker_state()
+                    return {"ok": False, "error": "worker failed to start within 180s"}
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            return {"ok": False, "error": "worker failed to start within 180s (superseded)"}
 
     def stop_worker(self) -> dict:
-        """Kill the worker subprocess (or release cpp backend) — frees ALL GPU/RAM."""
+        """Kill the worker subprocess (or release cpp backend) — frees ALL GPU/RAM.
+
+        Not under _op_lock: an unload may cut into a load (to free the GPU for
+        a gear shift). The load owns its worker and sees it was stopped."""
         with self._lock:
             # Handle gaia_cpp in-process backend
             if self._cpp_backend is not None:
@@ -565,14 +601,15 @@ class EngineManager:
                     quantize: str = "", prompt_format: str = "house") -> dict:
         """Swap models: drain, kill old worker, spawn new one. The drain stops
         a direct /model/swap from cutting a live generation (sy0s)."""
-        old_model = self.model_path
-        owner = self._begin_drain()
-        try:
-            self.stop_worker()
-            result = self.start_worker(model_path, device, compile_mode, quantize, prompt_format)
-        finally:
-            if owner:
-                self.resume()
+        with self._op_lock:  # uxfh: a second swap waits for this one
+            old_model = self.model_path
+            owner = self._begin_drain()
+            try:
+                self.stop_worker()
+                result = self.start_worker(model_path, device, compile_mode, quantize, prompt_format)
+            finally:
+                if owner:
+                    self.resume()
         if result.get("ok"):
             result["old_model"] = old_model
         return result
@@ -696,6 +733,8 @@ class EngineManager:
         gaia-doctor changes are needed for this to take effect.
         """
         data = self._build_health_response()
+        if data.get("mode") == "loading":
+            return data
         device = data.get("device")
         if device == "cuda" and "cuda_healthy" in data:
             # The worker probed CUDA in the process that actually holds the
@@ -734,6 +773,26 @@ class EngineManager:
         state consistently. llama-server's bare ``{"status":"ok"}`` body is
         normalized rather than passed through.
         """
+        loading = self._loading
+        if loading is not None:
+            # uxfh: a load in progress, not standby. Answered without _lock,
+            # which an in-process gaia_cpp load holds until it finishes.
+            return {
+                "status": "ok",
+                "engine": "gaia-managed",
+                "managed": True,
+                "model_loaded": False,
+                "mode": "loading",
+                "loading_model": loading["model_path"],
+                "loading_device": loading["device"],
+                "loading_for_s": round(time.time() - loading["since"], 1),
+                "backend": "none",
+                "device": loading["device"],
+                "model_path": loading["model_path"],
+                "draining": self._draining,
+                "active_inference": self._active_inference_count,
+            }
+
         # gaia_cpp in-process backend
         with self._lock:
             cpp = self._cpp_backend

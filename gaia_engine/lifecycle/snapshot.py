@@ -23,6 +23,7 @@ class TierLiveStatus(BaseModel):
     managed: bool = False           # Using managed engine (subprocess isolation)?
     healthy: bool = False           # Health endpoint responded?
     endpoint: str = ""              # Engine endpoint URL
+    loading: bool = False           # uxfh: engine /health mode=loading (a load in progress)
 
 
 class TransitionRecord(BaseModel):

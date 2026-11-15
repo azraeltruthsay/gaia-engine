@@ -10,6 +10,8 @@ from gaia_engine.manager import EngineManager
 
 def _mgr():
     m = EngineManager.__new__(EngineManager)
+    m._op_lock = threading.RLock()
+    m._loading = None
     m._lock = threading.Lock()
     m._draining = False
     m._drain_event = threading.Event()
@@ -62,6 +64,8 @@ class _Stop(Exception):
 
 def test_start_worker_clears_a_stale_drain(monkeypatch):
     m = EngineManager.__new__(EngineManager)
+    m._op_lock = threading.RLock()
+    m._loading = None
     m._lock, m._drain_event = threading.Lock(), threading.Event()
     m._draining, m.worker_process = True, None
 

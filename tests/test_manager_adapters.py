@@ -6,6 +6,7 @@ gaia_cpp /adapter/set answered ok without loading or clearing anything.
 """
 
 import json
+import threading
 
 from gaia_engine.manager import EngineManager
 
@@ -32,6 +33,8 @@ def _mgr(tmp_path):
     adir.mkdir()
     (adir / "adapter.gguf").write_bytes(b"gguf")
     m = EngineManager.__new__(EngineManager)
+    m._op_lock = threading.RLock()
+    m._loading = None
     m._adapter_paths = {}
     return m, str(adir)
 

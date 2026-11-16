@@ -220,12 +220,16 @@ class GaiaCppBackendAdapter:
         # d12t: KV reuse between requests (prefix reuse + in-memory
         # snapshots). GAIA_CPP_PREFIX_REUSE=0 restores the old stateless
         # behaviour; GAIA_CPP_KV_SNAPSHOTS sets the snapshot slots;
+        # GAIA_CPP_SNAPSHOT_MIN_TOKENS the shortest prompt read kept (ojwf);
         # GAIA_CPP_KV_BASELINE names a saved state to load at start.
         self._kv_control = hasattr(self._backend, "kv_stats")  # older .so: no KV API
         if self._kv_control:
             reuse = os.environ.get("GAIA_CPP_PREFIX_REUSE", "1") != "0"
             self._backend.set_prefix_reuse(reuse)
             self._backend.set_snapshot_slots(int(os.environ.get("GAIA_CPP_KV_SNAPSHOTS", "2")))
+            if hasattr(self._backend, "set_snapshot_min_tokens"):  # ojwf, older .so lacks it
+                self._backend.set_snapshot_min_tokens(
+                    int(os.environ.get("GAIA_CPP_SNAPSHOT_MIN_TOKENS", "128")))
             baseline = os.environ.get("GAIA_CPP_KV_BASELINE", "")
             if reuse and baseline and os.path.exists(baseline):
                 n = self._backend.load_state(baseline)

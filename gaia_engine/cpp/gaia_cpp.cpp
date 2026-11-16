@@ -554,6 +554,12 @@ public:
         if (!enabled) _invalidate_kv();
     }
 
+    // Shortest prompt read worth a snapshot (tokens evaluated).
+    void set_snapshot_min_tokens(int n) {
+        std::lock_guard<std::mutex> lock(inference_mtx_);
+        min_snapshot_tokens_ = static_cast<size_t>(std::max(1, n));
+    }
+
     // Number of unpinned in-memory snapshots kept (0 disables them). A
     // snapshot holds the full KV for its prompt: ~144 KB/token for an 8B
     // model with 36 layers and 8 KV heads, so ~430 MB at 3k tokens.
@@ -604,6 +610,7 @@ public:
         d["prefix_reuse"] = prefix_reuse_;
         d["cached_tokens"] = static_cast<int>(kv_tokens_.size());
         d["snapshot_slots"] = snapshot_slots_;
+        d["snapshot_min_tokens"] = static_cast<long long>(min_snapshot_tokens_);
         py::list snaps;
         size_t bytes = 0;
         for (const auto& sn : snapshots_) {
@@ -728,9 +735,11 @@ private:
         bool pinned = false;              // loaded baseline: never evicted
         uint64_t last_used = 0;
     };
-    // Snapshot only prompt reads at least this long: shorter ones are cheap
-    // to redo (~0.4 s on CPU) and not worth the memory.
-    static constexpr size_t kMinSnapshotTokens = 256;
+    // Snapshot only prompt reads at least this long. 256 assumed a short
+    // read was cheap (~0.4 s on the E4B); on the 12B on CPU 238 tokens take
+    // ~2 s, and GAIA's per-turn intent prompt (238) was never kept (ojwf,
+    // 2026-11-16). Settable: set_snapshot_min_tokens / GAIA_CPP_SNAPSHOT_MIN_TOKENS.
+    size_t min_snapshot_tokens_ = 128;
     // A snapshot replaces the live cache only if it saves this many more
     // tokens of reading than the live cache does (restoring costs a copy).
     static constexpr size_t kMinRestoreGain = 64;
@@ -949,7 +958,7 @@ private:
         // Keep a baseline of an expensive read so a later prompt sharing it
         // doesn't pay for it again after another caller has moved the cache.
         if (prefix_reuse_ && !full_capture
-                && static_cast<size_t>(result.evaluated_tokens) >= kMinSnapshotTokens) {
+                && static_cast<size_t>(result.evaluated_tokens) >= min_snapshot_tokens_) {
             _take_snapshot(/*pinned=*/false);
         }
 
@@ -1082,7 +1091,7 @@ private:
         stat_reused_ += static_cast<long long>(reuse);
         stat_evaluated_ += result.evaluated_tokens;
         stat_restores_ += restored;
-        if (prefix_reuse_ && static_cast<size_t>(result.evaluated_tokens) >= kMinSnapshotTokens) {
+        if (prefix_reuse_ && static_cast<size_t>(result.evaluated_tokens) >= min_snapshot_tokens_) {
             _take_snapshot(/*pinned=*/false);
         }
 
@@ -1296,6 +1305,7 @@ PYBIND11_MODULE(gaia_cpp, m) {
         // d12t: KV cache control
         .def("set_prefix_reuse",   &LlamaCppBackend::set_prefix_reuse, py::arg("enabled"))
         .def("set_snapshot_slots", &LlamaCppBackend::set_snapshot_slots, py::arg("n"))
+        .def("set_snapshot_min_tokens", &LlamaCppBackend::set_snapshot_min_tokens, py::arg("n"))
         .def("clear_kv",           &LlamaCppBackend::clear_kv)
         .def("save_state",         &LlamaCppBackend::save_state, py::arg("path"),
              py::call_guard<py::gil_scoped_release>())

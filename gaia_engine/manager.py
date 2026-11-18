@@ -1536,8 +1536,15 @@ class ManagedEngineHandler(BaseHTTPRequestHandler):
                 self.send_header(k, v)
         if "Content-Length" not in headers:
             self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # The client hung up first (a health probe or a caller that timed
+            # out). Nothing to deliver to; not an engine error, and the full
+            # traceback it logged read like one (GAIA ml4a).
+            logger.info("Client disconnected before the response to %s %s was sent",
+                        self.command, self.path)
 
 
 class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):

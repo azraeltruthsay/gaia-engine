@@ -1138,6 +1138,28 @@ def _vram_breakdown(device: str) -> Optional[Dict[str, int]]:
 
 # ── GAIA Engine ──────────────────────────────────────────────────────────────
 
+
+def always_bos(tokenizer) -> bool:
+    """Make `tokenizer` add <bos> whenever it adds special tokens (f8x8).
+
+    Gemma 4 12B's tokenizer ships with add_bos_token False while E4B's, the
+    GGUF (gaia_cpp) path and Google's chat template all start with <bos>, so
+    the torch text path sent none and the media paths did. One rule: every
+    prompt starts with <bos>. Calls with add_special_tokens=False (continuation
+    pieces) are unchanged. A tokenizer with no <bos> (Qwen) is left alone.
+    Returns True when it changed the tokenizer."""
+    bos_id = getattr(tokenizer, "bos_token_id", None)
+    if not getattr(tokenizer, "bos_token", None) or bos_id is None:
+        return False
+    try:
+        if tokenizer.encode("x")[:1] == [bos_id]:
+            return False
+        tokenizer.add_bos_token = True
+        return tokenizer.encode("x")[:1] == [bos_id]
+    except Exception:
+        return False
+
+
 class GAIAEngine:
     """The GAIA Inference Engine — self-aware inference for a sovereign AI.
 
@@ -1198,6 +1220,8 @@ class GAIAEngine:
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        if always_bos(self.tokenizer):
+            logger.info("Tokenizer set to add <bos> (it didn't by default)")
 
         # Check if model is pre-quantized (AWQ/GPTQ) — these load directly
         # via transformers integration, no manual quantization needed
@@ -3377,6 +3401,10 @@ class EngineHandler(BaseHTTPRequestHandler):
                     text_input = _engine.processor.apply_chat_template(
                         messages, tokenize=False, add_generation_prompt=True,
                     )
+                    # The template writes <bos> and the tokenizer adds one.
+                    _bos = getattr(_engine.tokenizer, "bos_token", None)
+                    if _bos and text_input.startswith(_bos):
+                        text_input = text_input[len(_bos):]
                     inputs = _engine.processor(
                         text=[text_input], images=[image],
                         return_tensors="pt", padding=True,

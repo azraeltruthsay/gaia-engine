@@ -918,6 +918,9 @@ GRAPH_DECODE_ENABLED = os.environ.get("GAIA_CUDA_GRAPHS", "1").lower() not in ("
 # dynamic-cache loop until checked.
 _GRAPH_VERIFIED_MODEL_TYPES = {"gemma4", "gemma4_text", "qwen3_vl", "qwen3_vl_text"}
 _GRAPH_MIN_LEN = 2048       # static buffers come in powers of two from here
+# xani: shrink after this many requests in a row needing <= 1/ratio of it.
+_GRAPH_SHRINK_AFTER = 3
+_GRAPH_SHRINK_RATIO = 4
 _GRAPH_VRAM_MARGIN_MB = 768  # left free after the buffers (WSL reports OOM as a driver fault)
 
 
@@ -1698,8 +1701,23 @@ class GAIAEngine:
         if gd is not None and key in gd.failed:
             return None
         if gd is not None and gd.model is self.model and gd.max_len >= needed_len:
-            return gd
-        length = max(_GRAPH_MIN_LEN, gd.max_len if gd is not None else 0)
+            # xani: each decode step costs in proportion to the static KV, and
+            # it only grew: one 9K prompt left Prime at 14 t/s (47 at 2048)
+            # until a restart. After a few requests in a row that need a
+            # quarter of it or less, rebuild it to fit them.
+            if gd.max_len > _GRAPH_MIN_LEN and needed_len * _GRAPH_SHRINK_RATIO <= gd.max_len:
+                self._graph_small_streak = getattr(self, "_graph_small_streak", 0) + 1
+            else:
+                self._graph_small_streak = 0
+            if self._graph_small_streak < _GRAPH_SHRINK_AFTER:
+                return gd
+            self._graph_small_streak = 0
+            logger.info("CUDA-graph decoder: shrinking static KV from %d tokens (recent requests need <= %d)",
+                        gd.max_len, needed_len)
+            length = _GRAPH_MIN_LEN
+        else:
+            self._graph_small_streak = 0
+            length = max(_GRAPH_MIN_LEN, gd.max_len if gd is not None else 0)
         while length < needed_len:
             length *= 2
         self._drop_graph_decoder()

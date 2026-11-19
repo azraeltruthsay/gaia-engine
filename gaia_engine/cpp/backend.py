@@ -502,8 +502,12 @@ class GaiaCppBackendAdapter:
         top_p: float = 0.9,
         enable_thinking: bool = True,
         repetition_penalty: float = 1.0,
+        session_id: str = "",
     ) -> dict:
-        """Non-streaming generation, returns OpenAI-compatible JSON dict."""
+        """Non-streaming generation, returns OpenAI-compatible JSON dict.
+        Writes the activation JSONL like stream_to_writer: most of a turn is
+        asked for this way, and since Core moved to gaia_cpp (2026-11-10)
+        none of it reached the activation stream (the brain map went dark)."""
         media: list = []
         prompt = self._build_prompt(messages, enable_thinking=enable_thinking, media=media)
 
@@ -517,6 +521,18 @@ class GaiaCppBackendAdapter:
                                     prompt, max_tokens, temperature, top_p, 0,
                                     bool(self.capture_layers))
         self._log_reuse(result)
+
+        if result.hidden_states:
+            try:
+                _write_activation(
+                    tier=self.tier,
+                    token=result.text[-1] if result.text else "",
+                    token_idx=result.completion_tokens - 1,
+                    session_id=session_id,
+                    snapshot=_snapshot_from_hidden_states(result.hidden_states),
+                )
+            except Exception:
+                logger.debug("activation write failed (non-fatal)", exc_info=True)
 
         # The native thought (Gemma 4 channel or Qwen3 <think>, closed or cut
         # off) travels as reasoning_content; it used to be stripped and lost.

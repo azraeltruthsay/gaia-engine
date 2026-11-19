@@ -1107,6 +1107,7 @@ class EngineManager:
                     messages, max_tokens, temperature, top_p,
                     enable_thinking=enable_thinking,
                     repetition_penalty=_repetition_penalty(req_data),
+                    session_id=req_data.get("session_id", ""),
                 )
                 # gaia_cpp can't stop on strings; honour `stop` afterwards
                 # so callers get the same text as from the torch worker.

@@ -621,6 +621,19 @@ class GaiaCppBackendAdapter:
 
     # ── Prompt formatting ─────────────────────────────────────────────────────
 
+    def _template_thinks(self) -> bool:
+        """Whether the GGUF's own chat template knows think blocks (see
+        prompt_format.template_thinks); read once from its header."""
+        thinks = getattr(self, "_thinks_cache", None)
+        if thinks is None:
+            from gaia_engine.prompt_format import gguf_string, template_thinks
+            path = os.path.realpath(self.model_path or "")
+            thinks = template_thinks(gguf_string(path, "tokenizer.chat_template") if path else None)
+            self._thinks_cache = thinks
+            if not thinks:
+                logger.info("gaia_cpp: the model's template has no think blocks; none written")
+        return thinks
+
     def _family(self) -> str:
         """'gemma' or 'chatml', from the GGUF's general.architecture.
 
@@ -713,7 +726,7 @@ class GaiaCppBackendAdapter:
             role = msg.get("role", "user")
             content = msg.get("content", "")
             parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
-        if enable_thinking:
+        if enable_thinking or not self._template_thinks():
             parts.append("<|im_start|>assistant\n")
         else:
             parts.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")

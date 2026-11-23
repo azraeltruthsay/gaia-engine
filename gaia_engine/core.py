@@ -482,7 +482,10 @@ class ChatFormatter:
         self.tokenizer = tokenizer
         self.prompt_format = normalize(prompt_format)
         self.family = self._detect_family()
-        logger.info("ChatFormatter: detected model family '%s'", self.family)
+        from gaia_engine.prompt_format import template_thinks
+        self.thinks = template_thinks(getattr(tokenizer, "chat_template", None))
+        logger.info("ChatFormatter: detected model family '%s'%s", self.family,
+                    "" if self.thinks else " (template has no think blocks)")
 
     def _detect_family(self) -> str:
         """Detect model family from tokenizer special tokens."""
@@ -531,7 +534,7 @@ class ChatFormatter:
             return prefix
         # ChatML
         prefix = "<|im_start|>assistant\n"
-        if not enable_thinking:
+        if not enable_thinking and getattr(self, "thinks", True):
             prefix += "<think>\n\n</think>\n\n"
         elif native_thinking:
             prefix += "<think>\n"

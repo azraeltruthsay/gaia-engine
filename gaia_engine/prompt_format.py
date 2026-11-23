@@ -42,3 +42,56 @@ def stock_gemma4(messages: Iterable[dict], enable_thinking: bool = False,
     if add_generation_prompt:
         out.append("<|turn>model\n" + ("" if enable_thinking else "<|channel>thought\n<channel|>"))
     return "".join(out)
+
+
+def template_thinks(template) -> bool:
+    """Whether a ChatML model's own chat template knows think blocks.
+
+    Thinking off writes an empty ``<think></think>`` after the assistant start:
+    right for Qwen3's hybrid models, whose template does the same. Qwen3-VL
+    *Instruct* (Prime v2b) never saw one, and given it answered
+    "Assistant\\nWashington." instead of "Washington.", or a URL fragment, or
+    nothing (2026-11-23). No template known: keep the block, as before.
+    """
+    text = str(template or "")
+    return not text.strip() or "<think>" in text
+
+
+def gguf_string(path: str, key: str):
+    """A string value from a GGUF file's metadata (e.g.
+    ``tokenizer.chat_template``), or None. Reads the header only."""
+    import struct
+    sizes = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"GGUF" or struct.unpack("<I", f.read(4))[0] < 2:
+                return None
+            _n_tensors, n_kv = struct.unpack("<QQ", f.read(16))
+
+            def text() -> bytes:
+                return f.read(struct.unpack("<Q", f.read(8))[0])
+
+            def skip(t: int) -> None:
+                if t == 8:
+                    f.seek(struct.unpack("<Q", f.read(8))[0], 1)
+                elif t == 9:
+                    et, n = struct.unpack("<IQ", f.read(12))
+                    if et == 8:
+                        for _ in range(n):
+                            f.seek(struct.unpack("<Q", f.read(8))[0], 1)
+                    elif et in sizes:
+                        f.seek(sizes[et] * n, 1)
+                    else:
+                        raise ValueError(f"nested GGUF array type {et}")
+                else:
+                    f.seek(sizes[t], 1)
+
+            for _ in range(n_kv):
+                k = text().decode("utf-8", "replace")
+                t = struct.unpack("<I", f.read(4))[0]
+                if k == key and t == 8:
+                    return text().decode("utf-8", "replace")
+                skip(t)
+    except (OSError, ValueError, KeyError, struct.error):
+        return None
+    return None

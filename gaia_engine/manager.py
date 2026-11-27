@@ -1123,6 +1123,20 @@ class EngineManager:
             except Exception as e:
                 return (500, ct, json.dumps({"error": str(e)}).encode())
 
+        if path == "/hidden/read" and method == "POST" and body:
+            # d3px: the last-token hidden state of chosen layers, read-only.
+            try:
+                req_data = json.loads(body)
+                result = cpp.read_hidden(
+                    req_data.get("messages", []), req_data.get("layers"),
+                    enable_thinking=bool((req_data.get("chat_template_kwargs") or {}).get("enable_thinking", False)))
+                return (200, ct, json.dumps(result).encode())
+            except ValueError as e:
+                return (400, ct, json.dumps({"error": str(e)}).encode())
+            except Exception as e:
+                logger.error("cpp hidden read error: %s", e)
+                return (500, ct, json.dumps({"error": str(e)}).encode())
+
         # ── LoRA adapter management ──────────────────────────────────────
         # Accepts both formats:
         #   cpp native: {"adapter_path": "/path/to/adapter.gguf", "scale": 1.0}

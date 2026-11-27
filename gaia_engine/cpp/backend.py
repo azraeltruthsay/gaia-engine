@@ -555,6 +555,40 @@ class GaiaCppBackendAdapter:
             },
         }
 
+    # ── Hidden-state read (d3px) ─────────────────────────────────────────────
+    # The mind's own state at the end of a chat-formatted prompt, before it
+    # says anything: what a probe reads to tell what a message asks of her.
+    # Read-only: nothing is generated and the KV cache is left as it was.
+
+    def read_hidden(self, messages: list, layers: Optional[List[int]] = None,
+                    enable_thinking: bool = False) -> dict:
+        """{"layers": {layer: [float, ...]}, "prompt_tokens": n} for the last
+        prompt token. `layers` defaults to the capture layers set at load."""
+        media: list = []
+        prompt = self._build_prompt(messages, enable_thinking=enable_thinking, media=media)
+        if media:
+            raise ValueError("hidden/read takes text messages only")
+        want = [int(x) for x in layers] if layers else list(self.capture_layers)
+        n_layers = self._backend.n_layer()
+        bad = [x for x in want if not 0 <= x < n_layers]
+        if bad:
+            raise ValueError(f"layers out of range 0..{n_layers - 1}: {bad}")
+        with self._request_lock:
+            changed = sorted(want) != sorted(self.capture_layers)
+            if changed:
+                self._backend.set_capture_layers(want)
+            try:
+                result = self._call(self._backend.generate, 1.0, prompt, 0, 0.0, 1.0, 0, True)
+            finally:
+                if changed:
+                    self._backend.set_capture_layers(self.capture_layers)
+        hs = result.hidden_states or {}
+        missing = [x for x in want if x not in hs]
+        if missing:
+            raise RuntimeError(f"no hidden state captured for layers {missing}")
+        return {"layers": {int(x): np.asarray(hs[x], dtype=np.float32).tolist() for x in want},
+                "prompt_tokens": result.prompt_tokens, "n_embd": self._backend.n_embd()}
+
     # ── Raw completions (ifzh) ───────────────────────────────────────────────
     # /v1/completions: the prompt is used as given (no chat template). The
     # orchestrator's Neural Handoff replays a captured prompt this way with

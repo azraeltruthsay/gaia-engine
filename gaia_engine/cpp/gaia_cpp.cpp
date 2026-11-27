@@ -196,6 +196,7 @@ public:
             : static_cast<int>(std::thread::hardware_concurrency() / 2);
         cparams.n_threads_batch = (n_threads_batch > 0) ? n_threads_batch : cparams.n_threads;
         if (n_gpu_layers == 0) gaia_cpu_only(cparams);
+        reader_threads_ = std::max(2, static_cast<int>(cparams.n_threads_batch) / 2);
 
         // KV cache precision (frlp): "f16" (default) or "q8_0", which halves
         // the cache (12B at 8k context: 2.5 -> ~1.3 GB of VRAM). A quantized V
@@ -229,6 +230,7 @@ public:
         _free_mtp();
         if (mtmd_) { mtmd_free(mtmd_); mtmd_ = nullptr; }
         lora_adapters_.clear();  // adapter memory managed by llama_model_free in b8250+
+        if (reader_ctx_) { llama_free(reader_ctx_); reader_ctx_ = nullptr; }
         if (ctx_)   { llama_free(ctx_); ctx_ = nullptr; }
         if (model_) { llama_model_free(model_); model_ = nullptr; }
         llama_backend_free();
@@ -712,6 +714,66 @@ private:
         mtp_n_max_ = 0;
         vram_mtp_ = 0;
     }
+
+public:
+    // ── Reader context (d3px) ────────────────────────────────────────────────
+    // A second, small context on the same weights that reads a prompt and
+    // returns the last-token hidden state of `layers`, generating nothing.
+    // Its own KV cache, capture state and lock: a read never waits for the
+    // main context's generation (the second mind's verdicts held Prime's for
+    // 7.7 s at a time, 2026-11-27). No LoRA adapter and no MTP: the probes
+    // read the plain model. Created on first use (small: kReaderCtx tokens).
+    std::unordered_map<int, std::vector<float>> read_hidden(const std::string& prompt,
+                                                            const std::vector<int>& layers,
+                                                            int* n_tokens = nullptr) {
+        std::lock_guard<std::mutex> lock(reader_mtx_);
+        if (!reader_ctx_) _init_reader();
+        std::vector<llama_token> toks = _tokenize(prompt, true);
+        if (toks.empty()) throw std::runtime_error("empty prompt");
+        if (toks.size() > static_cast<size_t>(kReaderCtx))
+            throw std::runtime_error("prompt longer than the reader's " + std::to_string(kReaderCtx) + " tokens");
+        if (n_tokens) *n_tokens = static_cast<int>(toks.size());
+        reader_state_.capture_layers = layers;
+        llama_memory_clear(llama_get_memory(reader_ctx_), true);
+        reader_state_.reset_captures();
+        reader_state_.active.store(true, std::memory_order_release);
+        llama_batch batch = llama_batch_get_one(toks.data(), static_cast<int32_t>(toks.size()));
+        int rc = llama_decode(reader_ctx_, batch);
+        reader_state_.active.store(false, std::memory_order_release);
+        llama_memory_clear(llama_get_memory(reader_ctx_), true);
+        if (rc != 0) throw std::runtime_error("reader decode failed (rc=" + std::to_string(rc) + ")");
+        std::unordered_map<int, std::vector<float>> out;
+        std::lock_guard<std::mutex> lk(reader_state_.mtx);
+        for (auto& [layer_idx, cap] : reader_state_.captures)
+            if (!cap.data.empty()) out[layer_idx] = cap.data;
+        return out;
+    }
+
+private:
+    // Small on purpose: on Core 12B (GPU) a 1024-token context with a
+    // 1024-token micro-batch cost 1.43 GB of VRAM, most of it Gemma's 262k-wide
+    // logits for every token of the micro-batch. The reader needs no logits.
+    static constexpr int kReaderCtx = 512;
+    static constexpr int kReaderUbatch = 64;
+
+    void _init_reader() {
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = kReaderCtx;
+        cp.n_batch = kReaderCtx;
+        cp.n_ubatch = kReaderUbatch;
+        cp.n_threads = reader_threads_;
+        cp.n_threads_batch = reader_threads_;
+        if (n_gpu_layers_ == 0) gaia_cpu_only(cp);
+        cp.cb_eval = gaia_cb_eval;
+        cp.cb_eval_user_data = &reader_state_;
+        reader_ctx_ = llama_init_from_model(model_, cp);
+        if (!reader_ctx_) throw std::runtime_error("could not create the reader context");
+    }
+
+    llama_context* reader_ctx_ = nullptr;
+    HiddenStateCaptureState reader_state_;
+    std::mutex reader_mtx_;
+    int reader_threads_ = 4;
 
     // Copy what the hidden-state callback captured (caller decides when the
     // capture belongs to a real token of the reply).
@@ -1351,6 +1413,21 @@ PYBIND11_MODULE(gaia_cpp, m) {
             py::arg("max_tokens") = 512, py::arg("temperature") = 0.7f, py::arg("top_p") = 0.9f,
             py::arg("top_k") = 0, py::arg("capture_hidden") = false,
             py::arg("repeat_penalty") = 1.0f)
+
+        .def("read_hidden",
+            [](LlamaCppBackend& self, const std::string& prompt, std::vector<int> layers) {
+                std::unordered_map<int, std::vector<float>> hs;
+                int n = 0;
+                {
+                    py::gil_scoped_release release;
+                    hs = self.read_hidden(prompt, layers, &n);
+                }
+                py::dict out;
+                out["layers"] = _hidden_states_to_numpy(hs);
+                out["prompt_tokens"] = n;
+                return out;
+            },
+            py::arg("prompt"), py::arg("layers"))
 
         .def("n_vocab",         &LlamaCppBackend::n_vocab)
         .def("n_embd",          &LlamaCppBackend::n_embd)

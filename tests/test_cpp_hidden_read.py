@@ -51,3 +51,17 @@ def test_default_layers_and_bad_layers():
     assert sorted(a.read_hidden([{"role": "user", "content": "hi"}])["layers"]) == [0, 4, 8]
     with pytest.raises(ValueError):
         a.read_hidden([{"role": "user", "content": "hi"}], layers=[99])
+
+
+def test_the_native_reader_is_used_without_the_generation_lock():
+    a = _adapter()
+    seen = []
+
+    def read_hidden(prompt, layers):
+        seen.append((prompt, list(layers), a._request_lock.locked()))
+        return {"layers": {x: [1.0, 2.0, 3.0] for x in layers}, "prompt_tokens": 4}
+    a._backend.read_hidden = read_hidden
+    with a._request_lock:     # a generation in progress
+        got = a.read_hidden([{"role": "user", "content": "hi"}], layers=[4])
+    assert got["reader"] and got["layers"] == {4: [1.0, 2.0, 3.0]} and seen[0][:2] == ("PROMPT:hi", [4])
+    assert not a._backend.calls   # the main context wasn't used

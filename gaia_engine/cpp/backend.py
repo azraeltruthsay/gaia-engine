@@ -573,6 +573,17 @@ class GaiaCppBackendAdapter:
         bad = [x for x in want if not 0 <= x < n_layers]
         if bad:
             raise ValueError(f"layers out of range 0..{n_layers - 1}: {bad}")
+        if hasattr(self._backend, "read_hidden"):
+            # Its own small context on the same weights: no wait for a
+            # generation in progress, and the main KV cache is untouched.
+            got = self._backend.read_hidden(prompt, want)
+            hs = got["layers"]
+            missing = [x for x in want if x not in hs]
+            if missing:
+                raise RuntimeError(f"no hidden state captured for layers {missing}")
+            return {"layers": {int(x): np.asarray(hs[x], dtype=np.float32).tolist() for x in want},
+                    "prompt_tokens": int(got["prompt_tokens"]), "n_embd": self._backend.n_embd(),
+                    "reader": True}
         with self._request_lock:
             changed = sorted(want) != sorted(self.capture_layers)
             if changed:

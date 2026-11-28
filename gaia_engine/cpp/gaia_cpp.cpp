@@ -785,6 +785,18 @@ private:
         return out;
     }
 
+    // One token's row from an all-tokens capture (token-major, n_embd each).
+    std::unordered_map<int, std::vector<float>> _copy_capture_row(size_t row) {
+        std::unordered_map<int, std::vector<float>> out;
+        std::lock_guard<std::mutex> lk(capture_state_.mtx);
+        for (auto& [layer_idx, cap] : capture_state_.captures) {
+            const size_t n = static_cast<size_t>(cap.n_embd);
+            if (n == 0 || cap.data.size() < (row + 1) * n) continue;
+            out[layer_idx].assign(cap.data.begin() + row * n, cap.data.begin() + (row + 1) * n);
+        }
+        return out;
+    }
+
     HiddenStateCaptureState capture_state_;
     std::mutex inference_mtx_;
     std::vector<llama_adapter_lora*> lora_adapters_;
@@ -972,7 +984,9 @@ private:
 
         // ojwf: speculative path. Not for full-prompt residual capture (SAE
         // atlas), which needs every prompt token's states from a fresh read.
-        if (spec_ && prompt_tokens.size() >= 2
+        // A prompt-only read (max_tokens 0) never reaches MTP's verify step, so
+        // it would capture the token before the last (o5g5): read it plainly.
+        if (spec_ && prompt_tokens.size() >= 2 && max_tokens > 0
                 && !(capture_hidden && capture_state_.all_tokens.load(std::memory_order_acquire))) {
             return _generate_mtp(prompt_tokens, token_cb, max_tokens, temperature, top_p, top_k, capture_hidden);
         }
@@ -1190,12 +1204,19 @@ private:
             for (size_t i = 0; i < draft.size(); ++i)
                 batch_tgt.add(draft[i], n_past + 1 + static_cast<int>(i), seq, true);
 
+            // Every row of the verify batch, so the state kept is the last
+            // token actually accepted (o5g5: keeping the batch's last row only
+            // when all drafts were accepted left the stream a few tokens behind).
             if (capture_hidden) {
                 capture_state_.reset_captures();
+                capture_state_.all_tokens.store(true, std::memory_order_release);
                 capture_state_.active.store(true, std::memory_order_release);
             }
             ret = llama_process(ctx_, LLAMA_PROCESS_TYPE_DECODE, batch_tgt.get());
-            if (capture_hidden) capture_state_.active.store(false, std::memory_order_release);
+            if (capture_hidden) {
+                capture_state_.active.store(false, std::memory_order_release);
+                capture_state_.all_tokens.store(false, std::memory_order_release);
+            }
             if (ret != 0 || !common_speculative_process(spec_, batch_tgt)) {
                 _invalidate_kv();  // context full or error: stop, don't trust the cache
                 break;
@@ -1214,8 +1235,9 @@ private:
             common_speculative_accept(spec_, seq, static_cast<uint16_t>(n_acc));
             result.draft_tokens += static_cast<int>(draft.size());
             result.draft_accepted += static_cast<int>(n_acc);
-            // Every batch row was a real token: keep its last-token states.
-            if (capture_hidden && n_acc == draft.size()) result.hidden_states = _copy_captures();
+            // Row n_acc is the last real token decoded: id_last plus the
+            // accepted drafts (rows past it were rejected drafts).
+            if (capture_hidden) result.hidden_states = _copy_capture_row(n_acc);
 
             prompt_tgt.push_back(id_last);  // in the KV
             for (size_t i = 0; i < ids.size(); ++i) {
